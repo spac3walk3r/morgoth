@@ -250,12 +250,12 @@ class MultinestFitTrigdat(object):
         if using_mpi:
             if rank == 0:
                 chains_dir_store = os.path.join(
-                    base_dir, self._grb_name, "trigdat", self._version, "chains_nn"
+                    base_dir, self._grb_name, "trigdat", self._version, "chains"
                 )
                 shutil.move(self._temp_chains_dir, chains_dir_store)
         else:
             chains_dir_store = os.path.join(
-                base_dir, self._grb_name, "trigdat", self._version, "chains_nn"
+                base_dir, self._grb_name, "trigdat", self._version, "chains"
             )
             shutil.move(self._temp_chains_dir, chains_dir_store)
 
@@ -401,14 +401,29 @@ class MultinestFitTTE(object):
         if use_monica:
             from morgoth.monica_backend.drmgen import MonicaDRMGen
 
+        def _resolve_gbm_file(datdir, stem):
+            versions = ["v03", "v02", "v01", "v00"]
+            exts = [".fit", ".fit.gz", ".pha", ".pha.gz", ".rsp2"]
+            for v in versions:
+                for ext in exts:
+                    p = os.path.join(datdir, f"{stem}_{v}{ext}")
+                    if os.path.isfile(p):
+                        return p
+            # fallback: first match
+            g = glob.glob(os.path.join(datdir, f"{stem}_v*"))
+            return g[0] if g else None
+
         det_ts = []
         det_rsp = []
 
+        datdir = os.path.join(base_dir, self._grb_name, "tte", "data")
+        grb_trig = self._grb_name.replace("GRB", "bn", 1)
+
         for det in self._use_dets:
-            # set up responses
-            tte_base = f"{base_dir}/{self._grb_name}/tte/data/glg_tte_{det}_bn{self._grb_name[3:]}_{self._version}.fit"
-            tte_file = tte_base if os.path.exists(tte_base) else (tte_base + ".gz" if os.path.exists(tte_base + ".gz") else tte_base)
-            cspec_file = f"{base_dir}/{self._grb_name}/tte/data/glg_cspec_{det}_bn{self._grb_name[3:]}_{self._version}.pha"
+            tte_file = _resolve_gbm_file(datdir, f"glg_tte_{det}_{grb_trig}")
+            cspec_file = _resolve_gbm_file(datdir, f"glg_cspec_{det}_{grb_trig}")
+            if tte_file is None or cspec_file is None:
+                raise RuntimeError(f"Missing TTE/CSPEC for {det} in {datdir}")
 
             if use_monica:
                 cfg = morgoth_config["drm_backend"]["monica"]
@@ -611,7 +626,7 @@ class MultinestFitTTE(object):
         Save the fits result to '{base_dir}/{grb_name}/{report_type}/{version}/tte_{version}_loc_results.fits'
         :return:
         """
-        fit_result_name = f"tte_{self._version}_loc_results_nn.fits"
+        fit_result_name = f"tte_{self._version}_loc_results.fits"
         fit_result_path = os.path.join(
             base_dir, self._grb_name, "tte", self._version, fit_result_name
         )
