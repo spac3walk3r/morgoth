@@ -3,6 +3,7 @@ import shutil
 import time
 
 import gbm_drm_gen as drm
+from gbm_drm_gen.drmgen_nn import DRMGenNN
 import matplotlib.pyplot as plt
 import numpy as np
 import yaml
@@ -14,6 +15,7 @@ from threeML.utils.spectrum.binned_spectrum import BinnedSpectrumWithDispersion
 from threeML.utils.time_series.event_list import EventListWithDeadTime
 from morgoth.utils.trig_reader import TrigReader
 
+import gbmgeometry
 
 from morgoth.utils.file_utils import if_dir_containing_file_not_existing_then_make
 
@@ -248,12 +250,12 @@ class MultinestFitTrigdat(object):
         if using_mpi:
             if rank == 0:
                 chains_dir_store = os.path.join(
-                    base_dir, self._grb_name, "trigdat", self._version, "chains"
+                    base_dir, self._grb_name, "trigdat", self._version, "chains_nn"
                 )
                 shutil.move(self._temp_chains_dir, chains_dir_store)
         else:
             chains_dir_store = os.path.join(
-                base_dir, self._grb_name, "trigdat", self._version, "chains"
+                base_dir, self._grb_name, "trigdat", self._version, "chains_nn"
             )
             shutil.move(self._temp_chains_dir, chains_dir_store)
 
@@ -393,22 +395,42 @@ class MultinestFitTTE(object):
         Set the plugins using the saved background hdf5 files
         :return:
         """
+        from morgoth.configuration import morgoth_config
+
+        use_monica = str(morgoth_config["drm_backend"]["kind"]).lower() == "monica"
+        if use_monica:
+            from morgoth.monica_backend.drmgen import MonicaDRMGen
 
         det_ts = []
         det_rsp = []
 
         for det in self._use_dets:
             # set up responses
-            tte_file = f"{base_dir}/{self._grb_name}/tte/data/glg_tte_{det}_bn{self._grb_name[3:]}_{self._version}.fit"
+            tte_base = f"{base_dir}/{self._grb_name}/tte/data/glg_tte_{det}_bn{self._grb_name[3:]}_{self._version}.fit"
+            tte_file = tte_base if os.path.exists(tte_base) else (tte_base + ".gz" if os.path.exists(tte_base + ".gz") else tte_base)
             cspec_file = f"{base_dir}/{self._grb_name}/tte/data/glg_cspec_{det}_bn{self._grb_name[3:]}_{self._version}.pha"
 
-            rsp = drm.DRMGenTTE(
-                tte_file=tte_file,
-                trigdat=self._trigdat_file,
-                mat_type=2,
-                cspecfile=cspec_file,
-                occult=True,
-            )
+            if use_monica:
+                cfg = morgoth_config["drm_backend"]["monica"]
+                rsp = MonicaDRMGen(
+                    det_name=det,
+                    trigdat_file=self._trigdat_file,
+                    cspecfile=cspec_file,
+                    model_path=cfg["model_path"],
+                    db_path=cfg["db_path"],
+                    nai_in_edges=cfg["nai_in_edges"],
+                    bgo_in_edges=cfg["bgo_in_edges"],
+                    device=cfg.get("device", "cpu"),
+                    batch_size=int(cfg.get("batch_size", 4096)),
+                )
+            else:
+                rsp = drm.DRMGenTTE(
+                    tte_file=tte_file,
+                    trigdat=self._trigdat_file,
+                    mat_type=2,
+                    cspecfile=cspec_file,
+                    occult=True,
+                )
 
             det_rsp.append(rsp)
 
@@ -589,7 +611,7 @@ class MultinestFitTTE(object):
         Save the fits result to '{base_dir}/{grb_name}/{report_type}/{version}/tte_{version}_loc_results.fits'
         :return:
         """
-        fit_result_name = f"tte_{self._version}_loc_results.fits"
+        fit_result_name = f"tte_{self._version}_loc_results_nn.fits"
         fit_result_path = os.path.join(
             base_dir, self._grb_name, "tte", self._version, fit_result_name
         )
@@ -712,3 +734,106 @@ class MultinestFitTTE(object):
                 spectrum_plot.savefig(plot_path, bbox_inches="tight")
             except Exception as e:
                 print(f"No spectral plot possible:\n{e}")
+
+
+class MultinestFitTTE_NN(MultinestFitTTE):
+    def __init__(self,
+                 grb_name,
+                 version,
+                 trigdat_file,
+                 bkg_fit_yaml_file,
+                 time_selection_yaml_file,
+                 models_dir=None,
+                 device="cpu"):
+        self._models_dir = models_dir
+        self._device = device
+        super().__init__(grb_name, version, trigdat_file, bkg_fit_yaml_file, time_selection_yaml_file)
+
+    def _set_plugins(self):
+        det_ts = []
+        det_rsp = []
+
+        # Pre-build a PositionInterpolator once; it is the same for all detectors
+        try:
+            pi = gbmgeometry.PositionInterpolator.from_trigdat(trigdat_file=self._trigdat_file)
+        except Exception:
+            pi = gbmgeometry.PositionInterpolator.from_trigdat_hdf5(trigdat_file=self._trigdat_file)
+
+        for det in self._use_dets:
+            # set up file paths
+            tte_base = f"{base_dir}/{self._grb_name}/tte/data/glg_tte_{det}_bn{self._grb_name[3:]}_{self._version}.fit"
+            tte_file = tte_base if os.path.exists(tte_base) else (tte_base + ".gz" if os.path.exists(tte_base + ".gz") else tte_base)
+            cspec_file = f"{base_dir}/{self._grb_name}/tte/data/glg_cspec_{det}_bn{self._grb_name[3:]}_{self._version}.pha"
+
+            # NN response: same geometry source, same occult setting as physics path
+            rsp_nn = DRMGenNN(position_interpolator=pi,
+                              det_name=det,            # accepts n0..nb,b0,b1 and normalizes internally
+                              time=0.0,                # initial time; BALROG_Like will set time before use
+                              models_dir=self._models_dir,
+                              device=self._device,
+                              occult=True)
+
+            det_rsp.append(rsp_nn)
+
+            # Time Series (unchanged)
+            gbm_tte_file = GBMTTEFile(tte_file)
+            event_list = EventListWithDeadTime(
+                arrival_times=gbm_tte_file.arrival_times - gbm_tte_file.trigger_time,
+                measurement=gbm_tte_file.energies,
+                n_channels=gbm_tte_file.n_channels,
+                start_time=gbm_tte_file.tstart - gbm_tte_file.trigger_time,
+                stop_time=gbm_tte_file.tstop - gbm_tte_file.trigger_time,
+                dead_time=gbm_tte_file.deadtime,
+                first_channel=0,
+                instrument=gbm_tte_file.det_name,
+                mission=gbm_tte_file.mission,
+                verbose=True,
+            )
+
+            success_restore = False
+            tries = 0
+            while not success_restore:
+                try:
+                    ts = TimeSeriesBuilder(
+                        det,
+                        event_list,
+                        response=BALROG_DRM(rsp_nn, 0.0, 0.0),  # same wrapper as physics, but with NN generator
+                        unbinned=False,
+                        verbose=True,
+                        container_type=BinnedSpectrumWithDispersion,
+                        restore_poly_fit=self._bkg_fit_files[det],
+                    )
+                    success_restore = True
+                    tries = 0
+                except Exception:
+                    time.sleep(1)
+                tries += 1
+                if tries == 50:
+                    raise AssertionError("Can not restore background fit...")
+
+            ts.set_active_time_interval(f"{self._active_time_start}-{self._active_time_stop}")
+            det_ts.append(ts)
+
+        # Mean of active time
+        rsp_time = (float(self._active_time_start) + float(self._active_time_stop)) / 2
+
+        # Spectrum Like (unchanged energy cuts)
+        det_sl = []
+        for series in det_ts:
+            sl = series.to_spectrumlike()
+            if series._name not in ("b0", "b1"):
+                sl.set_active_measurements("8.1-700")
+            else:
+                sl.set_active_measurements("350-25000")
+            det_sl.append(sl)
+
+        # Make Balrog Like (unchanged)
+        det_bl = []
+        for i, det in enumerate(self._use_dets):
+            det_bl.append(
+                drm.BALROGLike.from_spectrumlike(
+                    det_sl[i], rsp_time, det_rsp[i], free_position=True
+                )
+            )
+
+        self._data_list = DataList(*det_bl)
