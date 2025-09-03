@@ -2,6 +2,10 @@ import numpy as np
 import torch
 from astropy.io import fits
 
+from astropy.coordinates import SkyCoord
+import astropy.units as u
+from gbmgeometry.gbm_frame import GBMFrame
+
 from drm_monica.remap import remap_70to_outin
 from drm_monica.io.cspec import read_cspec_out_edges
 from drm_monica.db_reader import load_energy_axes, load_atm_grid_info
@@ -250,6 +254,32 @@ class MonicaDRMGen:
         feat = np.array([saz, caz, sel, cel, sth, cth, slt, clt, sph, cph, cof, ctn], dtype=np.float32)
         return feat
 
+    def set_time(self, t: float):
+        # BALROG_DRM may call this; Monica doesn’t need it, keep as no-op
+        self._lazy_init()
+        self._time = float(t)
+
+    def set_location(self, ra_deg: float, dec_deg: float):
+        """
+        BALROG_DRM calls this with sky coordinates (ICRS, degrees).
+        Convert to spacecraft-frame az/el using trigdat quaternion/SC position,
+        then delegate to set_location_direct_sat_coord.
+        """
+        self._lazy_init()
+        loc_icrs = SkyCoord(ra=float(ra_deg)*u.deg, dec=float(dec_deg)*u.deg, frame="icrs")
+        frame = GBMFrame(quaternion_1=self._quat[0],
+                         quaternion_2=self._quat[1],
+                         quaternion_3=self._quat[2],
+                         quaternion_4=self._quat[3],
+                         sc_pos_X=self._scpos[0],
+                         sc_pos_Y=self._scpos[1],
+                         sc_pos_Z=self._scpos[2])
+        loc_sat = loc_icrs.transform_to(frame)
+        az_deg = float((loc_sat.lon.deg + 360.0) % 360.0)
+        el_deg = float(loc_sat.lat.deg)
+        self.set_location_direct_sat_coord(az_deg, el_deg)
+    
+    
     def set_location_direct_sat_coord(self, az_deg: float, el_deg: float):
         """
         Set current source direction (spacecraft-frame az/el in degrees), compute DRM via Monica (70x64 -> remap),
