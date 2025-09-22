@@ -1,16 +1,16 @@
 import numpy as np
 import torch
-from astropy.io import fits
-
 from astropy.coordinates import SkyCoord
 import astropy.units as u
 from gbmgeometry.gbm_frame import GBMFrame
+import gbmgeometry
 
 from drm_monica.remap import remap_70to_outin
 from drm_monica.io.cspec import read_cspec_out_edges
 from drm_monica.db_reader import load_energy_axes, load_atm_grid_info
 
 from gbm_drm_gen.matrix_functions import geocoords
+from gbm_drm_gen.utils.geometry import is_occulted
 
 # Detector naming and normals (spacecraft frame) to compute cos(off-axis)
 DET_ORIENT_DEG = {
@@ -24,25 +24,32 @@ DET_ORIENT_DEG = {
 def _short_to_long(det_short: str) -> str:
     s = det_short.lower()
     if s.startswith("n"):
-        if s == "na": return "NAI_10"
-        if s == "nb": return "NAI_11"
+        if s == "na":
+            return "NAI_10"
+        if s == "nb":
+            return "NAI_11"
         idx = int(s[1])
         return f"NAI_0{idx}"
-    if s == "b0": return "BGO_00"
-    if s == "b1": return "BGO_01"
+    if s == "b0":
+        return "BGO_00"
+    if s == "b1":
+        return "BGO_01"
     raise ValueError(f"Unknown detector short name: {det_short}")
 
 def _long_to_group(long_name: str) -> str:
     if long_name.startswith("NAI_"):
         idx = int(long_name.split("_")[1])
         return f"n{idx}" if idx < 10 else ("na" if idx == 10 else "nb")
-    if long_name == "BGO_00": return "b0"
-    if long_name == "BGO_01": return "b1"
+    if long_name == "BGO_00":
+        return "b0"
+    if long_name == "BGO_01":
+        return "b1"
     raise ValueError(f"Cannot map to DB group: {long_name}")
 
 def _azel_to_unit(az_deg: float, el_deg: float) -> np.ndarray:
-    a = np.deg2rad(az_deg); e = np.deg2rad(el_deg)
-    return np.array([np.cos(e)*np.cos(a), np.cos(e)*np.sin(a), np.sin(e)], dtype=np.float64)
+    a = np.deg2rad(az_deg)
+    e = np.deg2rad(el_deg)
+    return np.array([np.cos(e) * np.cos(a), np.cos(e) * np.sin(a), np.sin(e)], dtype=np.float64)
 
 def _det_normal(long_name: str) -> np.ndarray:
     az, zen = DET_ORIENT_DEG[long_name]
@@ -65,7 +72,7 @@ class _MonicaNet(torch.nn.Module):
             torch.nn.Linear(hidden, hidden), torch.nn.ReLU(),
         )
         self.eff = torch.nn.Linear(hidden, 70)
-        self.shp = torch.nn.Linear(hidden, 70*64)
+        self.shp = torch.nn.Linear(hidden, 70 * 64)
         self.softplus = torch.nn.Softplus()
         self.softmax = torch.nn.Softmax(dim=-1)
 
@@ -76,9 +83,9 @@ class _MonicaNet(torch.nn.Module):
             emb = self.emb(det_id)
             x = torch.cat([x, emb], dim=-1)
         h = self.backbone(x)
-        eff = self.softplus(self.eff(h))              # (B,70)
+        eff = self.softplus(self.eff(h))  # (B,70)
         shp = self.softmax(self.shp(h).view(-1, 70, 64))  # (B,70,64)
-        y = eff.unsqueeze(-1) * shp                   # (B,70,64)
+        y = eff.unsqueeze(-1) * shp  # (B,70,64)
         return y
 
 class MonicaDRMGen:
@@ -86,10 +93,13 @@ class MonicaDRMGen:
     TTE-only Monica response adapter for BALROGLike/BALROG_DRM.
 
     Provides:
-      - set_location_direct_sat_coord(az_deg, el_deg)
+      - set_time(t): set geometry time from trigdat via PositionInterpolator
+      - set_location(ra, dec): ICRS sky coordinates
+      - set_location_direct_sat_coord(az, el): spacecraft frame az/el
       - matrix property: [N_out, N_in] (out-in)
-      - ebin edges accessors (if queried by callers)
+      - ebounds and monte_carlo_energies properties for OGIP/3ML callers
     """
+
     def __init__(self,
                  det_name: str,
                  trigdat_file: str,
@@ -99,7 +109,8 @@ class MonicaDRMGen:
                  nai_in_edges: str,
                  bgo_in_edges: str,
                  device: str = "cpu",
-                 batch_size: int = 4096):
+                 batch_size: int = 4096,
+                 occult: bool = True):
         self.det_short = det_name  # e.g., "n7", "na", "b0"
         self.det_long = _short_to_long(det_name)  # "NAI_07" ...
         self.det_group = _long_to_group(self.det_long)  # "n7" ...
@@ -111,12 +122,13 @@ class MonicaDRMGen:
         self.bgo_in_edges_path = bgo_in_edges
         self.device = device
         self.batch_size = int(batch_size)
+        self._occult = bool(occult)
 
         # Lazy state
         self._initialized = False
         self._matrix = None
 
-        # Expose edges (filled on init)
+        # Edges, filled on init
         self._in_edges = None
         self._out_edges = None
 
@@ -124,43 +136,41 @@ class MonicaDRMGen:
         if self._initialized:
             return
 
-        # Load per-detector fixed edges
+        # Output edges (from CSPEC EBOUNDS) and input edges (TTE family)
         self._out_edges = read_cspec_out_edges(self.cspecfile).astype(np.float64)
         if self.det_long.startswith("NAI_"):
             self._in_edges = np.load(self.nai_in_edges_path).astype(np.float64)
         else:
             self._in_edges = np.load(self.bgo_in_edges_path).astype(np.float64)
 
-        # Load per-detector DB axes
+        # Per-detector DB axes for remap
         e_in, _, epx_lo, epx_hi = load_energy_axes(self.db_path, self.det_group)
         self._e_in = e_in.astype(np.float64)
         self._epx_lo = epx_lo.astype(np.float64)
         self._epx_hi = epx_hi.astype(np.float64)
 
-        # Atmospheric grid edges -> centers (for snapping)
+        # Atmospheric grid centers (snapping)
         th_edge, lat_edge, phi_edge = load_atm_grid_info(self.db_path, self.det_group)
         self._theta_cent = 0.5 * (th_edge[:-1] + th_edge[1:])
-        self._lat_cent   = 0.5 * (lat_edge[:-1] + lat_edge[1:])
-        self._phi_cent   = 0.5 * (phi_edge[:-1] + phi_edge[1:])
+        self._lat_cent = 0.5 * (lat_edge[:-1] + lat_edge[1:])
+        self._phi_cent = 0.5 * (phi_edge[:-1] + phi_edge[1:])
 
         # Detector normal for cos(off-axis)
         self._det_n = _det_normal(self.det_long)
 
-        # Load trigdat geometry once (spacecraft quaternion and position)
-        with fits.open(self.trigdat_file, memmap=False) as f:
-            # Use the first TRIGRATE row (same convention as in Morgoth)
-            self._quat = np.array(f["TRIGRATE"].data["SCATTITD"][0], dtype=np.float64)  # [q0,q1,q2,q3]
-            self._scpos = np.array(f["TRIGRATE"].data["EIC"][0], dtype=np.float64)     # spacecraft position (ECEF-like)
+        # Position interpolator from trigdat for time-dependent geometry
+        self._pos = gbmgeometry.PositionInterpolator.from_trigdat(
+            trigdat_file=self.trigdat_file
+        )
+        self._update_sc_pose(0.0)
 
-        # Load Monica model checkpoint
+        # Load model checkpoint
         ckpt = torch.load(self.model_path, map_location="cpu")
         cfg = ckpt.get("config", {})
         in_dim = int(cfg.get("in_dim", 12))
         det_to_idx = ckpt.get("det_to_idx", None)
         if det_to_idx is None:
-            # Fallback mapping if absent
-            # Order must match training; we map NAI_00..NAI_11,BGO_00,BGO_01 if present
-            names = [f"NAI_0{i}" for i in range(10)] + ["NAI_10","NAI_11","BGO_00","BGO_01"]
+            names = [f"NAI_0{i}" for i in range(10)] + ["NAI_10", "NAI_11", "BGO_00", "BGO_01"]
             det_to_idx = {n: i for i, n in enumerate(names)}
         self._det_to_idx = det_to_idx
         self._det_id = int(det_to_idx[self.det_long])
@@ -171,10 +181,16 @@ class MonicaDRMGen:
 
         self._initialized = True
 
+    def _update_sc_pose(self, t: float):
+        """Update quaternion and spacecraft position for time t from interpolator."""
+        q = self._pos.quaternion(t)
+        sc = self._pos.sc_pos(t)
+        self._quat = np.asarray(q, dtype=np.float64)
+        self._scpos = np.asarray(sc, dtype=np.float64)
+
     def _earth_geo_az_el(self) -> tuple[float, float]:
         """
-        Compute Earth (nadir) az/el in spacecraft frame from trigdat quaternion and spacecraft position.
-        Matches the convention used in drm_monica/scripts/build_atm_dist.geo_az_el_from_quat_pos.
+        Compute Earth (nadir) az/el in spacecraft frame from quaternion and spacecraft position.
         """
         q0, q1, q2, q3 = self._quat
         scx = np.array([
@@ -192,14 +208,13 @@ class MonicaDRMGen:
             2.0*(q1*q2 - q3*q0),
             -q0*q0 - q1*q1 + q2*q2 + q3*q3,
         ], dtype=np.float64)
-        # Direction to Earth center in spacecraft frame
         geodir = np.array([-scx.dot(self._scpos), -scy.dot(self._scpos), -scz.dot(self._scpos)], dtype=np.float64)
         geodir /= (np.linalg.norm(geodir) + 1e-12)
         geo_az = np.arctan2(geodir[1], geodir[0])  # radians
         if geo_az < 0.0:
-            geo_az += 2.0*np.pi
+            geo_az += 2.0 * np.pi
         r_xy = np.hypot(geodir[0], geodir[1])
-        geo_el = np.arctan2(r_xy, geodir[2])   # elevation
+        geo_el = np.arctan2(r_xy, geodir[2])  # elevation
         return float(np.rad2deg(geo_az)), float(np.rad2deg(geo_el))
 
     def _build_features(self, src_az_deg: float, src_el_deg: float) -> np.ndarray:
@@ -210,10 +225,8 @@ class MonicaDRMGen:
            cos(off-axis), cos(theta_c)]
         with atmospheric (theta, lat, phi) snapped to nearest cell centers.
         """
-        # Earth geometry in spacecraft frame
         geo_az_deg, geo_el_deg = self._earth_geo_az_el()
 
-        # Compute latitude via classic geocoords (training convention)
         theta_geo = 90.0 - geo_el_deg
         phi_geo = geo_az_deg
         theta_src = 90.0 - src_el_deg
@@ -226,21 +239,16 @@ class MonicaDRMGen:
         cos_lat = np.clip(gz.dot(sl), -1.0, 1.0)
         lat_deg = 180.0 - np.rad2deg(np.arccos(cos_lat))
 
-        # Snap to nearest atmospheric centers
         theta_c = float(self._theta_cent[_nearest_index(theta_geo, self._theta_cent)])
-        lat_c   = float(self._lat_cent[_nearest_index(lat_deg, self._lat_cent)])
-        # Wrap phi into [0, 360)
+        lat_c = float(self._lat_cent[_nearest_index(lat_deg, self._lat_cent)])
         phi_wrapped = (phi_geo + 360.0) % 360.0
-        phi_c   = float(self._phi_cent[_nearest_index(phi_wrapped, self._phi_cent)])
+        phi_c = float(self._phi_cent[_nearest_index(phi_wrapped, self._phi_cent)])
 
-        # cos(off-axis)
         s = _azel_to_unit(src_az_deg, src_el_deg)
         cof = float(np.clip(self._det_n.dot(s), -1.0, 1.0))
 
-        # cos(theta_c) proxy
         ctn = float(np.cos(np.deg2rad(theta_c)))
 
-        # trig features
         def _trig(deg):
             r = np.deg2rad(deg)
             return np.sin(r), np.cos(r)
@@ -255,9 +263,10 @@ class MonicaDRMGen:
         return feat
 
     def set_time(self, t: float):
-        # BALROG_DRM may call this; Monica doesn’t need it, keep as no-op
+        """Update internal geometry time (used by BALROG/3ML)."""
         self._lazy_init()
         self._time = float(t)
+        self._update_sc_pose(self._time)
 
     def set_location(self, ra_deg: float, dec_deg: float):
         """
@@ -266,7 +275,14 @@ class MonicaDRMGen:
         then delegate to set_location_direct_sat_coord.
         """
         self._lazy_init()
-        loc_icrs = SkyCoord(ra=float(ra_deg)*u.deg, dec=float(dec_deg)*u.deg, frame="icrs")
+        # Occultation check in sky coordinates, mirroring classic behavior
+        if self._occult and is_occulted(float(ra_deg), float(dec_deg), self._scpos):
+            Nout = len(self._out_edges) - 1
+            Nin = len(self._in_edges) - 1
+            self._matrix = np.zeros((Nout, Nin), dtype=np.float64, order="C")
+            return
+
+        loc_icrs = SkyCoord(ra=float(ra_deg) * u.deg, dec=float(dec_deg) * u.deg, frame="icrs")
         frame = GBMFrame(quaternion_1=self._quat[0],
                          quaternion_2=self._quat[1],
                          quaternion_3=self._quat[2],
@@ -278,14 +294,20 @@ class MonicaDRMGen:
         az_deg = float((loc_sat.lon.deg + 360.0) % 360.0)
         el_deg = float(loc_sat.lat.deg)
         self.set_location_direct_sat_coord(az_deg, el_deg)
-    
-    
+
     def set_location_direct_sat_coord(self, az_deg: float, el_deg: float):
         """
         Set current source direction (spacecraft-frame az/el in degrees), compute DRM via Monica (70x64 -> remap),
-        and store as out-in [N_out, N_in] matrix in self._matrix.
+        and store as out-in [N_out, N_in] matrix.
         """
         self._lazy_init()
+
+        # Optional occultation in spacecraft frame (mirrors classic usage)
+        if self._occult and is_occulted(float(az_deg), float(el_deg), self._scpos):
+            Nout = len(self._out_edges) - 1
+            Nin = len(self._in_edges) - 1
+            self._matrix = np.zeros((Nout, Nin), dtype=np.float64, order="C")
+            return
 
         # Build features for this det/direction
         x = self._build_features(float(az_deg), float(el_deg)).reshape(1, -1)
@@ -298,7 +320,6 @@ class MonicaDRMGen:
         # Remap to requested edges (out-in orientation for Morgoth/3ML)
         R = remap_70to_outin(self._in_edges, self._out_edges,
                              self._e_in, self._epx_lo, self._epx_hi, M70)
-        # Ensure contiguous C-order
         self._matrix = np.ascontiguousarray(R, dtype=np.float64)
 
     @property
@@ -307,7 +328,7 @@ class MonicaDRMGen:
             raise RuntimeError("Call set_location_direct_sat_coord() before accessing matrix")
         return self._matrix
 
-    # Optional helpers if callers query edges
+    # Optional helpers if callers query edges with Monica-specific names
     @property
     def ebin_edge_in(self) -> np.ndarray:
         self._lazy_init()
@@ -317,4 +338,14 @@ class MonicaDRMGen:
     def ebin_edge_out(self) -> np.ndarray:
         self._lazy_init()
         return self._out_edges
-        
+
+    # Aliases expected by BALROG_DRM / OGIPResponse
+    @property
+    def ebounds(self) -> np.ndarray:
+        self._lazy_init()
+        return self._out_edges
+
+    @property
+    def monte_carlo_energies(self) -> np.ndarray:
+        self._lazy_init()
+        return self._in_edges

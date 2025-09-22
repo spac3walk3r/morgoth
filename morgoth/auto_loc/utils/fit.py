@@ -231,7 +231,7 @@ class MultinestFitTrigdat(object):
 
         self._bayes.set_sampler("multinest", share_spectrum=True)
         self._bayes.sampler.setup(
-            n_live_points=800, chain_name=chain_path, wrapped_params=wrap, verbose=True
+            n_live_points=500, chain_name=chain_path, wrapped_params=wrap, verbose=True
         )
         self._bayes.sample()
 
@@ -244,6 +244,7 @@ class MultinestFitTrigdat(object):
         fit_result_path = os.path.join(
             base_dir, self._grb_name, "trigdat", self._version, fit_result_name
         )
+        os.makedirs(os.path.dirname(fit_result_path), exist_ok=True)
 
         if using_mpi:
             if rank == 0:
@@ -269,6 +270,7 @@ class MultinestFitTrigdat(object):
             chains_dir_store = os.path.join(
                 base_dir, self._grb_name, "trigdat", self._version, "chains"
             )
+            os.makedirs(os.path.dirname(chains_dir_store), exist_ok=True)
             shutil.move(self._temp_chains_dir, chains_dir_store)
 
     def create_spectrum_plot(self):
@@ -413,6 +415,82 @@ class MultinestFitTTE(object):
         self._set_plugins()
         self._define_model()
 
+    def _resolve_bkg(self):
+        """
+        Resolve a single background YAML (regardless of backend-specific folders)
+        and normalize HDF5 paths so both backends can reuse the same background fits.
+        This overrides self._use_dets and self._bkg_fit_files.
+        """
+        # Candidate YAMLs (in priority order)
+        candidates = [
+            self._bkg_fit_yaml_file,
+            os.path.join(base_dir, self._grb_name, "tte", self._version, "bkg_fit_tte.yml"),
+            os.path.join(base_dir, self._grb_name, "tte", "drmgen", "bkg_fit_tte_drmgen.yml"),
+            os.path.join(base_dir, self._grb_name, "tte", "monica-nn", "bkg_fit_tte_monica-nn.yml"),
+        ]
+        data = None
+        yaml_path = None
+        for p in candidates:
+            if p and os.path.isfile(p):
+                try:
+                    with open(p, "r") as f:
+                        data = yaml.safe_load(f)
+                    yaml_path = p
+                    break
+                except Exception:
+                    pass
+        if data is None:
+            raise FileNotFoundError(f"Could not find a background YAML among: {candidates}")
+
+        yaml_dir = os.path.dirname(yaml_path)
+
+        # Normalize detector names
+        raw_use = data.get("use_dets", []) or list(data.get("bkg_fit_files", {}).keys())
+        def _as_name(x):
+            if isinstance(x, int) or (isinstance(x, str) and x.isdigit()):
+                return _id_to_name(int(x))
+            return str(x)
+        use_names = [_as_name(x) for x in raw_use]
+
+        # Normalize HDF5 paths: make absolute and ensure file exists
+        in_map = data.get("bkg_fit_files", {})
+        resolved_map = {}
+
+        # Candidate directories (in decreasing priority)
+        candidate_dirs = [
+            yaml_dir,
+            os.path.join(base_dir, self._grb_name, "tte", self._version, "bkg_files"),
+            os.path.join(base_dir, self._grb_name, "tte", "bkg_files"),
+            os.path.join(base_dir, self._grb_name, "tte", "drmgen", "bkg_files"),
+            os.path.join(base_dir, self._grb_name, "tte", "monica-nn", "bkg_files"),
+        ]
+
+        for det_key, p in in_map.items():
+            det = _as_name(det_key)
+            # Build path candidates
+            candidates_p = []
+            if p:
+                if os.path.isabs(p):
+                    candidates_p.append(p)
+                else:
+                    candidates_p.append(os.path.normpath(os.path.join(yaml_dir, p)))
+            # try by basename in canonical locations
+            base = os.path.basename(p) if p else f"bkg_det_{det}.h5"
+            for ddir in candidate_dirs:
+                candidates_p.append(os.path.join(ddir, base))
+            # pick first existing
+            resolved = next((pp for pp in candidates_p if os.path.isfile(pp)), None)
+            if resolved:
+                resolved_map[det] = resolved
+
+        # Keep only dets with a resolved background file
+        use_names = [d for d in use_names if d in resolved_map]
+        if not use_names:
+            # fallback to all resolved keys if use_dets was unusable
+            use_names = sorted(resolved_map.keys())
+        self._use_dets = use_names
+        self._bkg_fit_files = resolved_map
+
     def _set_plugins(self):
         """
         Set the plugins using the saved background hdf5 files
@@ -458,6 +536,9 @@ class MultinestFitTTE(object):
 
         det_ts = []
         det_rsp = []
+
+        # Resolve background YAML and normalize bkg file paths (backend-agnostic)
+        self._resolve_bkg()
 
         datdir = os.path.join(base_dir, self._grb_name, "tte", "data")
         grb_trig = self._grb_name.replace("GRB", "bn", 1)
@@ -518,7 +599,7 @@ class MultinestFitTTE(object):
                         unbinned=False,
                         verbose=True,
                         container_type=BinnedSpectrumWithDispersion,
-                        restore_poly_fit=self._bkg_fit_files[det],
+                        restore_poly_fit=self._bkg_fit_files.get(det),
                     )
 
                     success_restore = True
@@ -659,7 +740,7 @@ class MultinestFitTTE(object):
         self._bayes.set_sampler("multinest", share_spectrum=True)
 
         self._bayes.sampler.setup(
-            n_live_points=800, chain_name=chain_path, wrapped_params=wrap, verbose=True
+            n_live_points=500, chain_name=chain_path, wrapped_params=wrap, verbose=True
         )
         self._bayes.sample()
 
@@ -672,6 +753,7 @@ class MultinestFitTTE(object):
         fit_result_path = os.path.join(
             base_dir, self._grb_name, "tte", self._version, fit_result_name
         )
+        os.makedirs(os.path.dirname(fit_result_path), exist_ok=True)
 
         if using_mpi:
             if rank == 0:
@@ -697,6 +779,7 @@ class MultinestFitTTE(object):
             chains_dir_store = os.path.join(
                 base_dir, self._grb_name, "tte", self._version, "chains"
             )
+            os.makedirs(os.path.dirname(chains_dir_store), exist_ok=True)
             shutil.move(self._temp_chains_dir, chains_dir_store)
 
     def create_spectrum_plot(self):
