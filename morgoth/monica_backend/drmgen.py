@@ -1,3 +1,7 @@
+import os
+import time
+import atexit
+import csv
 import numpy as np
 import torch
 from astropy.coordinates import SkyCoord
@@ -5,14 +9,17 @@ import astropy.units as u
 from gbmgeometry.gbm_frame import GBMFrame
 import gbmgeometry
 
-from drm_monica.remap import remap_70to_outin
+from drm_monica.remap import remap_70to_outin, build_remap_precompute, remap_apply_precomputed
 from drm_monica.io.cspec import read_cspec_out_edges
 from drm_monica.db_reader import load_energy_axes, load_atm_grid_info
-
 from gbm_drm_gen.matrix_functions import geocoords
 from gbm_drm_gen.utils.geometry import is_occulted
 
-# Detector naming and normals (spacecraft frame) to compute cos(off-axis)
+try:
+    from morgoth.configuration import morgoth_config
+except Exception:
+    morgoth_config = None
+
 DET_ORIENT_DEG = {
     "NAI_00": (45.89, 20.58), "NAI_01": (45.11, 45.31), "NAI_02": (58.44, 90.21),
     "NAI_03": (314.87, 45.24), "NAI_04": (303.15, 90.27), "NAI_05": (3.35, 89.97),
@@ -53,67 +60,88 @@ def _azel_to_unit(az_deg: float, el_deg: float) -> np.ndarray:
 
 def _det_normal(long_name: str) -> np.ndarray:
     az, zen = DET_ORIENT_DEG[long_name]
-    # Convert zenith to elevation
     el = 90.0 - zen
     return _azel_to_unit(az, el)
 
 def _nearest_index(val: float, centers: np.ndarray) -> int:
     return int(np.argmin(np.abs(centers - val)))
 
-class _MonicaNet(torch.nn.Module):
-    # Minimal Monica MLP for inference (matches training in drm-monica/scripts/train_baseline.py)
-    def __init__(self, in_dim: int, det_count: int, det_emb_dim: int = 8, hidden: int = 256):
+class _MonicaNetDense(torch.nn.Module):
+    def __init__(self, in_dim: int, det_count: int, hidden_dims=(256,256,256), det_emb_dim: int = 8):
+        super().__init__()
+        self.emb = torch.nn.Embedding(det_count, det_emb_dim) if det_count > 1 else None
+        feat_in = in_dim + (det_emb_dim if self.emb is not None else 0)
+        h1,h2,h3 = hidden_dims
+        self.fc1 = torch.nn.Linear(feat_in, h1)
+        self.fc2 = torch.nn.Linear(h1, h2)
+        self.fc3 = torch.nn.Linear(h2, h3)
+        self.act = torch.nn.ReLU()
+        self.eff = torch.nn.Linear(h3, 70)
+        self.shp = torch.nn.Linear(h3, 70*64)
+        self.softplus = torch.nn.Softplus()
+        self.softmax = torch.nn.Softmax(dim=-1)
+    @torch.no_grad()
+    def forward(self, x, det_id=None):
+        if self.emb is not None and det_id is not None:
+            x = torch.cat([x, self.emb(det_id)], dim=-1)
+        h = self.act(self.fc1(x)); h = self.act(self.fc2(h)); h = self.act(self.fc3(h))
+        eff = self.softplus(self.eff(h))
+        shp = self.softmax(self.shp(h).view(-1,70,64))
+        return eff.unsqueeze(-1)*shp
+
+class _MonicaNetSeq(torch.nn.Module):
+    def __init__(self, in_dim: int, det_count: int, hidden=256, det_emb_dim: int = 8):
         super().__init__()
         self.emb = torch.nn.Embedding(det_count, det_emb_dim) if det_count > 1 else None
         feat_in = in_dim + (det_emb_dim if self.emb is not None else 0)
         self.backbone = torch.nn.Sequential(
             torch.nn.Linear(feat_in, hidden), torch.nn.ReLU(),
-            torch.nn.Linear(hidden, hidden), torch.nn.ReLU(),
-            torch.nn.Linear(hidden, hidden), torch.nn.ReLU(),
+            torch.nn.Linear(hidden, hidden),  torch.nn.ReLU(),
+            torch.nn.Linear(hidden, hidden),  torch.nn.ReLU()
         )
         self.eff = torch.nn.Linear(hidden, 70)
-        self.shp = torch.nn.Linear(hidden, 70 * 64)
+        self.shp = torch.nn.Linear(hidden, 70*64)
         self.softplus = torch.nn.Softplus()
         self.softmax = torch.nn.Softmax(dim=-1)
-
     @torch.no_grad()
-    def forward(self, x: torch.Tensor, det_id: torch.Tensor | None):
-        # x: (B, in_dim), det_id: (B,) long tensor or None
+    def forward(self, x, det_id=None):
         if self.emb is not None and det_id is not None:
-            emb = self.emb(det_id)
-            x = torch.cat([x, emb], dim=-1)
+            x = torch.cat([x, self.emb(det_id)], dim=-1)
         h = self.backbone(x)
-        eff = self.softplus(self.eff(h))  # (B,70)
-        shp = self.softmax(self.shp(h).view(-1, 70, 64))  # (B,70,64)
-        y = eff.unsqueeze(-1) * shp  # (B,70,64)
-        return y
+        eff = self.softplus(self.eff(h))
+        shp = self.softmax(self.shp(h).view(-1,70,64))
+        return eff.unsqueeze(-1)*shp
+
+def _resolve_model_path(cfg_node: dict | None, fallback: str) -> str:
+    p_env = os.environ.get("MONICA_CKPT")
+    if p_env:
+        return p_env
+    if isinstance(cfg_node, dict):
+        model_set = cfg_node.get("model_set", None)
+        if isinstance(model_set, dict) and model_set:
+            name = os.environ.get("MONICA_MODEL") or cfg_node.get("selected_model", "")
+            if name:
+                mp = model_set.get(name)
+                if mp:
+                    return mp
+        p_cfg = cfg_node.get("model_path", "")
+        if p_cfg:
+            return p_cfg
+    return fallback or ""
+
+def _get_mpi_rank() -> str:
+    for k in ("OMPI_COMM_WORLD_RANK", "PMI_RANK", "MPI_RANKID", "SLURM_PROCID"):
+        v = os.getenv(k)
+        if v is not None:
+            return v
+    return "0"
 
 class MonicaDRMGen:
-    """
-    TTE-only Monica response adapter for BALROGLike/BALROG_DRM.
-
-    Provides:
-      - set_time(t): set geometry time from trigdat via PositionInterpolator
-      - set_location(ra, dec): ICRS sky coordinates
-      - set_location_direct_sat_coord(az, el): spacecraft frame az/el
-      - matrix property: [N_out, N_in] (out-in)
-      - ebounds and monte_carlo_energies properties for OGIP/3ML callers
-    """
-
-    def __init__(self,
-                 det_name: str,
-                 trigdat_file: str,
-                 cspecfile: str,
-                 model_path: str,
-                 db_path: str,
-                 nai_in_edges: str,
-                 bgo_in_edges: str,
-                 device: str = "cpu",
-                 batch_size: int = 4096,
-                 occult: bool = True):
-        self.det_short = det_name  # e.g., "n7", "na", "b0"
-        self.det_long = _short_to_long(det_name)  # "NAI_07" ...
-        self.det_group = _long_to_group(self.det_long)  # "n7" ...
+    def __init__(self, det_name, trigdat_file, cspecfile, model_path,
+                 db_path, nai_in_edges, bgo_in_edges, device="cpu", batch_size=4096, occult=True):
+        self.det_short = det_name
+        self.det_long = _short_to_long(det_name)
+        self.det_group = _long_to_group(self.det_long)
         self.trigdat_file = trigdat_file
         self.cspecfile = cspecfile
         self.model_path = model_path
@@ -124,50 +152,68 @@ class MonicaDRMGen:
         self.batch_size = int(batch_size)
         self._occult = bool(occult)
 
-        # Lazy state
         self._initialized = False
         self._matrix = None
 
-        # Edges, filled on init
         self._in_edges = None
         self._out_edges = None
+
+        self._t_feat = 0.0
+        self._t_model = 0.0
+        self._t_remap = 0.0
+        self._n_calls = 0
+        self._profile = (os.getenv("MONICA_PROFILE", "0") == "1")
+        self._profile_csv = os.getenv("MONICA_PROFILE_CSV", "").strip()
+        self._profile_csv_dir = os.getenv("MONICA_PROFILE_CSV_DIR", "").strip()
+        self._run_tag = os.getenv("MONICA_RUN_TAG", "").strip()
+        self._model_label_env = os.getenv("MONICA_MODEL_LABEL", "").strip()
+        self._rank = _get_mpi_rank()
+        base = os.path.basename(self.trigdat_file)
+        self._bn = ""
+        for tok in base.replace(".", "_").split("_"):
+            if tok.startswith("bn") and len(tok) >= 11:
+                self._bn = tok
+                break
 
     def _lazy_init(self):
         if self._initialized:
             return
 
-        # Output edges (from CSPEC EBOUNDS) and input edges (TTE family)
         self._out_edges = read_cspec_out_edges(self.cspecfile).astype(np.float64)
         if self.det_long.startswith("NAI_"):
             self._in_edges = np.load(self.nai_in_edges_path).astype(np.float64)
         else:
             self._in_edges = np.load(self.bgo_in_edges_path).astype(np.float64)
 
-        # Per-detector DB axes for remap
         e_in, _, epx_lo, epx_hi = load_energy_axes(self.db_path, self.det_group)
         self._e_in = e_in.astype(np.float64)
         self._epx_lo = epx_lo.astype(np.float64)
         self._epx_hi = epx_hi.astype(np.float64)
 
-        # Atmospheric grid centers (snapping)
         th_edge, lat_edge, phi_edge = load_atm_grid_info(self.db_path, self.det_group)
         self._theta_cent = 0.5 * (th_edge[:-1] + th_edge[1:])
         self._lat_cent = 0.5 * (lat_edge[:-1] + lat_edge[1:])
         self._phi_cent = 0.5 * (phi_edge[:-1] + phi_edge[1:])
 
-        # Detector normal for cos(off-axis)
         self._det_n = _det_normal(self.det_long)
 
-        # Position interpolator from trigdat for time-dependent geometry
-        self._pos = gbmgeometry.PositionInterpolator.from_trigdat(
-            trigdat_file=self.trigdat_file
-        )
+        self._pos = gbmgeometry.PositionInterpolator.from_trigdat(trigdat_file=self.trigdat_file)
         self._update_sc_pose(0.0)
 
-        # Load model checkpoint
-        ckpt = torch.load(self.model_path, map_location="cpu")
+        cfg_node = None
+        if morgoth_config is not None:
+            try:
+                cfg_node = morgoth_config["drm_backend"]["monica"]
+            except Exception:
+                cfg_node = None
+        model_path = _resolve_model_path(cfg_node, self.model_path)
+        if not model_path or not os.path.isfile(model_path):
+            raise RuntimeError(f"Monica model checkpoint not found: {model_path}")
+
+        ckpt = torch.load(model_path, map_location="cpu")
         cfg = ckpt.get("config", {})
         in_dim = int(cfg.get("in_dim", 12))
+
         det_to_idx = ckpt.get("det_to_idx", None)
         if det_to_idx is None:
             names = [f"NAI_0{i}" for i in range(10)] + ["NAI_10", "NAI_11", "BGO_00", "BGO_01"]
@@ -175,23 +221,62 @@ class MonicaDRMGen:
         self._det_to_idx = det_to_idx
         self._det_id = int(det_to_idx[self.det_long])
 
-        self._model = _MonicaNet(in_dim=in_dim, det_count=len(det_to_idx))
-        self._model.load_state_dict(ckpt["model"])
-        self._model.to(self.device).eval()
+        state_keys = list(ckpt["model"].keys())
+        if any(k.startswith("backbone.") for k in state_keys):
+            hidden = int(cfg.get("hidden", 256))
+            model = _MonicaNetSeq(in_dim=in_dim, det_count=len(det_to_idx), hidden=hidden)
+            model_label_from_cfg = f"dense{hidden}"
+        else:
+            if "hidden_dims" in cfg:
+                hidden_dims = tuple(int(x) for x in cfg["hidden_dims"])
+            elif "hidden" in cfg:
+                h = int(cfg.get("hidden", 256))
+                hidden_dims = (h, h, h)
+            else:
+                hidden_dims = (256, 256, 256)
+            model = _MonicaNetDense(in_dim=in_dim, det_count=len(det_to_idx), hidden_dims=hidden_dims)
+            model_label_from_cfg = f"h={hidden_dims[0]}-{hidden_dims[1]}-{hidden_dims[2]}"
+
+        model.load_state_dict(ckpt["model"])
+        self._model = model.to(self.device).eval()
+
+        if os.getenv("MONICA_DQ", "0") == "1":
+            try:
+                from torch.ao.quantization import quantize_dynamic
+                self._model = quantize_dynamic(self._model, {torch.nn.Linear}, dtype=torch.qint8)
+            except Exception:
+                pass
+        if os.getenv("MONICA_JIT", "0") == "1":
+            try:
+                ex_x = torch.randn(1, in_dim, dtype=torch.float32)
+                ex_det = torch.zeros(1, dtype=torch.long)
+                self._model = torch.jit.trace(self._model, (ex_x, ex_det))
+            except Exception:
+                pass
+
+        # Precompute fast remap weights
+        self._pre = None
+        try:
+            self._pre = build_remap_precompute(
+                e_in=self._e_in, epx_lo=self._epx_lo, epx_hi=self._epx_hi,
+                target_in_edges=self._in_edges, target_out_edges=self._out_edges
+            )
+        except Exception:
+            self._pre = None  # fallback to original remap
+
+        self._model_label = self._model_label_env or model_label_from_cfg
+        if self._profile:
+            atexit.register(self._write_profile_csv)
 
         self._initialized = True
 
     def _update_sc_pose(self, t: float):
-        """Update quaternion and spacecraft position for time t from interpolator."""
         q = self._pos.quaternion(t)
         sc = self._pos.sc_pos(t)
         self._quat = np.asarray(q, dtype=np.float64)
         self._scpos = np.asarray(sc, dtype=np.float64)
 
     def _earth_geo_az_el(self) -> tuple[float, float]:
-        """
-        Compute Earth (nadir) az/el in spacecraft frame from quaternion and spacecraft position.
-        """
         q0, q1, q2, q3 = self._quat
         scx = np.array([
             q0*q0 - q1*q1 - q2*q2 + q3*q3,
@@ -210,78 +295,55 @@ class MonicaDRMGen:
         ], dtype=np.float64)
         geodir = np.array([-scx.dot(self._scpos), -scy.dot(self._scpos), -scz.dot(self._scpos)], dtype=np.float64)
         geodir /= (np.linalg.norm(geodir) + 1e-12)
-        geo_az = np.arctan2(geodir[1], geodir[0])  # radians
+        geo_az = np.arctan2(geodir[1], geodir[0])
         if geo_az < 0.0:
             geo_az += 2.0 * np.pi
         r_xy = np.hypot(geodir[0], geodir[1])
-        geo_el = np.arctan2(r_xy, geodir[2])  # elevation
+        geo_el = np.arctan2(r_xy, geodir[2])
         return float(np.rad2deg(geo_az)), float(np.rad2deg(geo_el))
 
     def _build_features(self, src_az_deg: float, src_el_deg: float) -> np.ndarray:
-        """
-        12-dim feature vector used during training:
-          [sin/cos src_az, sin/cos src_el,
-           sin/cos theta_c, sin/cos lat_c, sin/cos phi_c,
-           cos(off-axis), cos(theta_c)]
-        with atmospheric (theta, lat, phi) snapped to nearest cell centers.
-        """
         geo_az_deg, geo_el_deg = self._earth_geo_az_el()
-
         theta_geo = 90.0 - geo_el_deg
         phi_geo = geo_az_deg
         theta_src = 90.0 - src_el_deg
         phi_src = src_az_deg
-
         gx, gy, gz, sl = geocoords(np.deg2rad(theta_geo), np.deg2rad(phi_geo),
                                    np.deg2rad(theta_src), np.deg2rad(phi_src))
         gz = np.asarray(gz, dtype=float).ravel()
         sl = np.asarray(sl, dtype=float).ravel()
         cos_lat = np.clip(gz.dot(sl), -1.0, 1.0)
         lat_deg = 180.0 - np.rad2deg(np.arccos(cos_lat))
-
         theta_c = float(self._theta_cent[_nearest_index(theta_geo, self._theta_cent)])
         lat_c = float(self._lat_cent[_nearest_index(lat_deg, self._lat_cent)])
         phi_wrapped = (phi_geo + 360.0) % 360.0
         phi_c = float(self._phi_cent[_nearest_index(phi_wrapped, self._phi_cent)])
-
         s = _azel_to_unit(src_az_deg, src_el_deg)
         cof = float(np.clip(self._det_n.dot(s), -1.0, 1.0))
-
         ctn = float(np.cos(np.deg2rad(theta_c)))
-
         def _trig(deg):
             r = np.deg2rad(deg)
             return np.sin(r), np.cos(r)
-
         saz, caz = _trig(src_az_deg)
         sel, cel = _trig(src_el_deg)
         sth, cth = _trig(theta_c)
         slt, clt = _trig(lat_c)
         sph, cph = _trig(phi_c)
-
         feat = np.array([saz, caz, sel, cel, sth, cth, slt, clt, sph, cph, cof, ctn], dtype=np.float32)
         return feat
 
     def set_time(self, t: float):
-        """Update internal geometry time (used by BALROG/3ML)."""
         self._lazy_init()
         self._time = float(t)
         self._update_sc_pose(self._time)
 
     def set_location(self, ra_deg: float, dec_deg: float):
-        """
-        BALROG_DRM calls this with sky coordinates (ICRS, degrees).
-        Convert to spacecraft-frame az/el using trigdat quaternion/SC position,
-        then delegate to set_location_direct_sat_coord.
-        """
         self._lazy_init()
-        # Occultation check in sky coordinates, mirroring classic behavior
         if self._occult and is_occulted(float(ra_deg), float(dec_deg), self._scpos):
             Nout = len(self._out_edges) - 1
             Nin = len(self._in_edges) - 1
             self._matrix = np.zeros((Nout, Nin), dtype=np.float64, order="C")
             return
-
         loc_icrs = SkyCoord(ra=float(ra_deg) * u.deg, dec=float(dec_deg) * u.deg, frame="icrs")
         frame = GBMFrame(quaternion_1=self._quat[0],
                          quaternion_2=self._quat[1],
@@ -296,31 +358,74 @@ class MonicaDRMGen:
         self.set_location_direct_sat_coord(az_deg, el_deg)
 
     def set_location_direct_sat_coord(self, az_deg: float, el_deg: float):
-        """
-        Set current source direction (spacecraft-frame az/el in degrees), compute DRM via Monica (70x64 -> remap),
-        and store as out-in [N_out, N_in] matrix.
-        """
         self._lazy_init()
-
-        # Optional occultation in spacecraft frame (mirrors classic usage)
         if self._occult and is_occulted(float(az_deg), float(el_deg), self._scpos):
             Nout = len(self._out_edges) - 1
             Nin = len(self._in_edges) - 1
             self._matrix = np.zeros((Nout, Nin), dtype=np.float64, order="C")
             return
 
-        # Build features for this det/direction
+        t0 = time.perf_counter()
         x = self._build_features(float(az_deg), float(el_deg)).reshape(1, -1)
+        self._t_feat += time.perf_counter() - t0
+
+        t1 = time.perf_counter()
         x_t = torch.from_numpy(x).to(self.device)
         det_id = torch.tensor([self._det_id], dtype=torch.long, device=self.device)
-
         with torch.no_grad():
             M70 = self._model(x_t, det_id).squeeze(0).cpu().numpy().astype(np.float64)
+        self._t_model += time.perf_counter() - t1
 
-        # Remap to requested edges (out-in orientation for Morgoth/3ML)
-        R = remap_70to_outin(self._in_edges, self._out_edges,
-                             self._e_in, self._epx_lo, self._epx_hi, M70)
+        t2 = time.perf_counter()
+        if self._pre is not None:
+            M_inout = remap_apply_precomputed(M70, self._pre)   # (N_in x N_out)
+            R = M_inout.T                                      # (N_out x N_in)
+        else:
+            R = remap_70to_outin(self._in_edges, self._out_edges, self._e_in, self._epx_lo, self._epx_hi, M70)
+        self._t_remap += time.perf_counter() - t2
+
+        self._n_calls += 1
         self._matrix = np.ascontiguousarray(R, dtype=np.float64)
+
+    def _write_profile_csv(self):
+        if not self._profile or self._n_calls == 0:
+            return
+        total = self._t_feat + self._t_model + self._t_remap
+        if total <= 0:
+            return
+        # destination
+        if self._profile_csv:
+            out_path = self._profile_csv
+            os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        else:
+            d = self._profile_csv_dir or os.getcwd()
+            os.makedirs(d, exist_ok=True)
+            tag = self._bn or "bn_unknown"
+            fname = f"profile_{tag}_{self.det_long}_rank{self._rank}.csv"
+            out_path = os.path.join(d, fname)
+
+        mean_feat_ms = self._t_feat / self._n_calls * 1000.0
+        mean_model_ms = self._t_model / self._n_calls * 1000.0
+        mean_remap_ms = self._t_remap / self._n_calls * 1000.0
+        share_feat = self._t_feat / total
+        share_model = self._t_model / total
+        share_remap = self._t_remap / total
+
+        header = ["bn","det","rank","run_tag","model_label",
+                  "calls","mean_feat_ms","mean_model_ms","mean_remap_ms",
+                  "share_feat","share_model","share_remap"]
+        row = [self._bn, self.det_long, self._rank, self._run_tag, (self._model_label_env or self._model_label),
+               int(self._n_calls), mean_feat_ms, mean_model_ms, mean_remap_ms,
+               share_feat, share_model, share_remap]
+        try:
+            newf = not os.path.exists(out_path)
+            with open(out_path, "a", newline="") as f:
+                w = csv.writer(f)
+                if newf:
+                    w.writerow(header)
+                w.writerow(row)
+        except Exception:
+            print(f"[Monica profile] {row}")
 
     @property
     def matrix(self) -> np.ndarray:
@@ -328,7 +433,6 @@ class MonicaDRMGen:
             raise RuntimeError("Call set_location_direct_sat_coord() before accessing matrix")
         return self._matrix
 
-    # Optional helpers if callers query edges with Monica-specific names
     @property
     def ebin_edge_in(self) -> np.ndarray:
         self._lazy_init()
@@ -339,7 +443,6 @@ class MonicaDRMGen:
         self._lazy_init()
         return self._out_edges
 
-    # Aliases expected by BALROG_DRM / OGIPResponse
     @property
     def ebounds(self) -> np.ndarray:
         self._lazy_init()
