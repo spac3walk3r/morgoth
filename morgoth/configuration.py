@@ -51,12 +51,18 @@ structure["drm_backend"] = dict(
         bgo_in_edges="",
 
         # Per-family/per-detector out-in models and out-edge files
-        nai_model="",           # checkpoint for NaI out-in model
-        bgo00_model="",         # checkpoint for BGO_00 out-in model
-        bgo01_model="",         # checkpoint for BGO_01 out-in model
-        nai_out_edges="",       # npy edges for NaI EBOUNDS
-        bgo00_out_edges="",     # npy edges for BGO_00 EBOUNDS
-        bgo01_out_edges="",     # npy edges for BGO_01 EBOUNDS
+        # Shared NaI model (optional fallback if side-specific not provided)
+        nai_model="",            # checkpoint for NaI out-in model (all NaIs)
+        # Side-specific NaI models (preferred): NAI_00..NAI_05 use nai_side0_model; NAI_06..NAI_11 use nai_side1_model
+        nai_side0_model="",      # checkpoint for NAI_00..NAI_05
+        nai_side1_model="",      # checkpoint for NAI_06..NAI_11
+        bgo00_model="",          # checkpoint for BGO_00 out-in model
+        bgo01_model="",          # checkpoint for BGO_01 out-in model
+
+        # Optional out-edge files (not needed for trigdat; kept for CSPEC/TTE compatibility)
+        nai_out_edges="",
+        bgo00_out_edges="",
+        bgo01_out_edges="",
 
         # Runtime
         device="cpu",

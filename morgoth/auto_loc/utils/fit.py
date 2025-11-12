@@ -107,32 +107,99 @@ class MultinestFitTrigdat(object):
 
     def _set_plugins(self):
         """
-        Set the plugins using the saved background hdf5 files
-        :return:
+        Set the plugins using the saved background hdf5 files (trigdat path).
+        When drm_backend.kind == "monica", build plugins with MonicaDRMGenTrig;
+        otherwise use the classic TrigReader.to_plugin().
         """
+        from morgoth.configuration import morgoth_config
+
+        # Restore background polynomials into TrigReader
         success_restore = False
-        i = 0
+        tries = 0
         while not success_restore:
             try:
                 trig_reader = TrigReader(
                     self._trigdat_file,
-                    fine=self._fine,
+                    fine=False,  # trigdat is coarse
                     verbose=False,
                     restore_poly_fit=self._bkg_fit_files,
                 )
                 success_restore = True
-                i = 0
-            except:
+                tries = 0
+            except Exception:
                 time.sleep(1)
-            i += 1
-            if i == 50:
-                raise AssertionError("Can not restore background fit...")
+                tries += 1
+                if tries == 50:
+                    raise AssertionError("Can not restore trigdat background fit...")
 
-        trig_reader.set_active_time_interval(self._active_time)
+        # Set active interval from YAML
+        active_time = f"{self._active_time_start}-{self._active_time_stop}"
+        trig_reader.set_active_time_interval(active_time)
 
-        trig_data = trig_reader.to_plugin(*self._use_dets)
+        # Branch: Monica vs classic
+        use_monica = str(morgoth_config["drm_backend"]["kind"]).lower() == "monica"
+        if not use_monica:
+            # Classic: let TrigReader build plugins internally (uses DRMGenTrig)
+            trig_data = trig_reader.to_plugin(*self._use_dets)
+            self._data_list = DataList(*trig_data)
+            return
 
-        self._data_list = DataList(*trig_data)
+        # Monica branch: build per-detector plugins manually
+        from morgoth.monica_backend.drmgen import MonicaDRMGenTrig
+        # Pull Monica config
+        cfg_node = morgoth_config["drm_backend"]["monica"]
+        def cfg_get(key, default=None):
+            try:
+                v = cfg_node[key]
+                if v is None or (isinstance(v, str) and v.strip() == ""):
+                    return default
+                return v
+            except Exception:
+                return default
+        model_path   = cfg_get("model_path")  # native 70×64; leave empty if using family out-in
+        db_path      = cfg_get("db_path")
+        nai_in_edges = cfg_get("nai_in_edges")
+        bgo_in_edges = cfg_get("bgo_in_edges")
+        device       = cfg_get("device", "cpu")
+        batch_size   = int(cfg_get("batch_size", 4096))
+        missing = [n for n, val in [("db_path", db_path), ("nai_in_edges", nai_in_edges), ("bgo_in_edges", bgo_in_edges)]
+                if val is None]
+        if missing:
+            raise RuntimeError(f"Monica trigdat requires config keys: {', '.join(missing)} in drm_backend.monica")
+
+        det_bl = []
+        # Mean of active time for response time stamp (matches your TTE logic)
+        rsp_time = (float(self._active_time_start) + float(self._active_time_stop)) / 2.0
+
+        # Note: trig_reader._time_series is a dict of TimeSeriesBuilder per detector (short names "n0".. "b1")
+        # We will use those builders to create SpectrumLike plugins and attach Monica responses.
+        for det in self._use_dets:
+            # Get the per-detector TimeSeriesBuilder object
+            ts = trig_reader._time_series[det]
+
+            # Ensure the active interval is set for this builder
+            ts.set_active_time_interval(active_time)
+
+            # Build Monica trigdat response for this detector
+            rsp = MonicaDRMGenTrig(
+                det_name=det,                          # short name "n7"/"b0" is fine; class maps internally
+                trigdat_file=self._trigdat_file,
+                model_path=str(model_path or ""),      # optional for native; ignored if using family out-in
+                db_path=str(db_path),
+                nai_in_edges=str(nai_in_edges),
+                bgo_in_edges=str(bgo_in_edges),
+                device=str(device),
+                batch_size=batch_size,
+                occult=True,
+            )
+
+            # Convert the time series to a SpectrumLike and wrap in a BALROG-like with Monica DRM
+            sl = ts.to_spectrumlike()
+            bl = drm.BALROGLike.from_spectrumlike(sl, rsp_time, rsp, free_position=True)
+            det_bl.append(bl)
+
+        # Package into a DataList
+        self._data_list = DataList(*det_bl)
 
     def _define_model(self, spectrum="cpl"):
         """
