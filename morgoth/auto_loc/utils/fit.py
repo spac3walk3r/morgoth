@@ -19,6 +19,10 @@ import gbmgeometry
 
 from morgoth.utils.file_utils import if_dir_containing_file_not_existing_then_make
 
+# Set the global NumPy seed as a precaution
+SEED = 12345
+np.random.seed(SEED) 
+
 _gbm_detectors = (
     "n0",
     "n1",
@@ -137,7 +141,8 @@ class MultinestFitTrigdat(object):
         trig_reader.set_active_time_interval(active_time)
 
         # Branch: Monica vs classic
-        use_monica = str(morgoth_config["drm_backend"]["kind"]).lower() == "monica"
+        kind = os.getenv("MORGOTH_DRM_BACKEND_KIND", str(morgoth_config["drm_backend"]["kind"]))
+        use_monica = kind.strip().lower() == "monica"
         if not use_monica:
             # Classic: let TrigReader build plugins internally (uses DRMGenTrig)
             trig_data = trig_reader.to_plugin(*self._use_dets)
@@ -565,7 +570,8 @@ class MultinestFitTTE(object):
         """
         from morgoth.configuration import morgoth_config
 
-        use_monica = str(morgoth_config["drm_backend"]["kind"]).lower() == "monica"
+        kind = os.getenv("MORGOTH_DRM_BACKEND_KIND", str(morgoth_config["drm_backend"]["kind"]))
+        use_monica = kind.strip().lower() == "monica"
         if use_monica:
             from morgoth.monica_backend.drmgen import MonicaDRMGen
             # Extract config safely (configya Node)
@@ -797,7 +803,7 @@ class MultinestFitTTE(object):
         )
         chain_path = os.path.join(self._temp_chains_dir, f"tte_{self._version}_")
 
-        # Make temp chains folder if it does not exists already
+        # Make temp chains folder if it does not exist already
         if not os.path.exists(self._temp_chains_dir):
             os.mkdir(os.path.join(self._temp_chains_dir))
 
@@ -807,8 +813,11 @@ class MultinestFitTTE(object):
         self._bayes.set_sampler("multinest", share_spectrum=True)
 
         self._bayes.sampler.setup(
-            n_live_points=500, chain_name=chain_path, wrapped_params=wrap, verbose=True
+            n_live_points=400, chain_name=chain_path, wrapped_params=wrap, verbose=True, seed=SEED
         )
+        #self._bayes.sampler.setup(
+        #    n_live_points=400, chain_name=chain_path, wrapped_params=wrap, importance_nested_sampling=True, verbose=True, seed=SEED
+        #)
         self._bayes.sample()
 
     def save_fit_result(self):

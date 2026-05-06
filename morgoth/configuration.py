@@ -74,7 +74,8 @@ class MorgothConfig(YAMLConfig):
     def __init__(self):
         super(MorgothConfig, self).__init__(
             structure=structure,
-            config_path="~/.morgoth",
+            #config_path="~/.morgoth",
+            config_path="/home/abacelj/.morgoth",
             config_name="morgoth_config.yml",
         )
 

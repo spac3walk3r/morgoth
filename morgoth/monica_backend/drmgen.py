@@ -2,6 +2,7 @@ import os
 import time
 import atexit
 import csv
+import sys
 import numpy as np
 import torch
 from astropy.coordinates import SkyCoord
@@ -16,10 +17,16 @@ from drm_monica.io.cspec import read_cspec_out_edges
 from gbm_drm_gen.matrix_functions import geocoords
 from gbm_drm_gen.utils.geometry import is_occulted
 
+# import the actual native model classes used in training
+sys.path.insert(0, "/data/abacelj/REPOS_2025/drm-monica/scripts")
+from train_baseline import MonicaNetDense, MonicaNetDirect, MonicaNetFactorized
+
 try:
     from morgoth.configuration import morgoth_config
 except Exception:
     morgoth_config = None
+
+
 
 def cfg_get(node, key, default=""):
     try:
@@ -30,6 +37,62 @@ def cfg_get(node, key, default=""):
         return s if s else default
     except Exception:
         return default
+    
+
+def _resolve_monica_ckpt_for_detector(det_long: str, cfgm) -> str:
+    """
+    Resolve the preferred checkpoint path for a detector.
+
+    Priority:
+      NaIs:
+        side-specific -> nai_model -> model_path
+      BGOs:
+        per-detector -> other BGO key -> model_path
+
+    The function does NOT assume native vs out-in; that is inferred later
+    from the checkpoint config.
+    """
+    if cfgm is None:
+        return ""
+
+    model_path = cfg_get(cfgm, "model_path", "")
+
+    if det_long.startswith("NAI_"):
+        idx = int(det_long.split("_")[1])  # 0..11
+        if idx <= 5:
+            cand = cfg_get(cfgm, "nai_side0_model", "")
+            if cand:
+                return cand
+        else:
+            cand = cfg_get(cfgm, "nai_side1_model", "")
+            if cand:
+                return cand
+
+        cand = cfg_get(cfgm, "nai_model", "")
+        if cand:
+            return cand
+        return model_path
+
+    if det_long == "BGO_00":
+        cand = cfg_get(cfgm, "bgo00_model", "")
+        if cand:
+            return cand
+        cand = cfg_get(cfgm, "bgo01_model", "")  # allow shared BGO model
+        if cand:
+            return cand
+        return model_path
+
+    if det_long == "BGO_01":
+        cand = cfg_get(cfgm, "bgo01_model", "")
+        if cand:
+            return cand
+        cand = cfg_get(cfgm, "bgo00_model", "")  # allow shared BGO model
+        if cand:
+            return cand
+        return model_path
+
+    return model_path
+
 
 DET_ORIENT_DEG = {
     "NAI_00": (45.89, 20.58), "NAI_01": (45.11, 45.31), "NAI_02": (58.44, 90.21),
@@ -216,6 +279,8 @@ class _BatchGroup:
         # Forward once
         t_model0 = time.perf_counter()
         Y = self.model(X, D)
+        if isinstance(Y, tuple):
+            Y = Y[0]
         t_model = time.perf_counter() - t_model0
         outs = []
         for bi, inst in enumerate(self.instances):
@@ -359,40 +424,32 @@ class MonicaDRMGen:
         self._lat_cent   = 0.5 * (lat_edge[:-1] + lat_edge[1:])
         self._phi_cent   = 0.5 * (phi_edge[:-1] + phi_edge[1:])
 
-        # Resolve out-in model paths and edges per detector
-        ckpt_outin, in_edges_path, out_edges_path = (None, None, None)
-        try:
-            if self.det_long.startswith("NAI_"):
-                # Side-specific selection: NAI_00..NAI_05 -> side0, NAI_06..NAI_11 -> side1
-                idx = int(self.det_long.split("_")[1])  # 0..11
-                if idx <= 5:
-                    ckpt_outin = cfg_get(cfgm, "nai_side0_model") or cfg_get(cfgm, "nai_model")
-                else:
-                    ckpt_outin = cfg_get(cfgm, "nai_side1_model") or cfg_get(cfgm, "nai_model")
-                # Input edges for NaIs
-                in_edges_path = cfg_get(cfgm, "nai_in_edges")
-                # Trigdat out edges are fixed; we already set self._out_edges via get_trigdat_out_edges
-                out_edges_path = None
-            elif self.det_long == "BGO_00":
-                ckpt_outin = cfg_get(cfgm, "bgo00_model")
-                in_edges_path = cfg_get(cfgm, "bgo_in_edges")
-                out_edges_path = None
-            elif self.det_long == "BGO_01":
-                ckpt_outin = cfg_get(cfgm, "bgo01_model")
-                in_edges_path = cfg_get(cfgm, "bgo_in_edges")
-                out_edges_path = None
-        except Exception:
-            pass
-        use_outin = bool(ckpt_outin and os.path.isfile(ckpt_outin))
+        # Family input edges
+        if self.det_long.startswith("NAI_"):
+            in_edges_path = self.nai_in_edges_path_arg or (cfg_get(cfgm, "nai_in_edges") if cfgm else "")
+        else:
+            in_edges_path = self.bgo_in_edges_path_arg or (cfg_get(cfgm, "bgo_in_edges") if cfgm else "")
+        if not in_edges_path:
+            raise RuntimeError(f"Input edges path not provided for family of {self.det_long}")
 
+        self._in_edges = np.load(in_edges_path).astype(np.float64)
+        self._out_edges = read_cspec_out_edges(self.cspecfile).astype(np.float64)
+
+        # Resolve checkpoint for this detector
+        ckpt_path = _resolve_monica_ckpt_for_detector(self.det_long, cfgm)
+        if (not ckpt_path) or (not os.path.isfile(ckpt_path)):
+            raise RuntimeError(f"Monica checkpoint not found for {self.det_long}: {ckpt_path}")
+
+        # Load checkpoint config to decide native vs out-in
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        cfg = ckpt.get("config", {}) or {}
+        target_tag = str(cfg.get("target", "")).lower()
+        use_outin = (target_tag == "outin")
+
+        # -------------------------
+        # OUT-IN path
+        # -------------------------
         if use_outin:
-            # Load edges for this detector
-            self._in_edges = np.load(in_edges_path).astype(np.float64)
-            self._out_edges = np.load(out_edges_path).astype(np.float64)
-
-            # Load checkpoint, config, and build the right head
-            ckpt = torch.load(ckpt_outin, map_location="cpu")
-            cfg = ckpt.get("config", {})
             in_dim = int(cfg.get("in_dim", 12))
             n_in  = int(cfg.get("n_in", len(self._in_edges) - 1))
             n_out = int(cfg.get("n_out", len(self._out_edges) - 1))
@@ -406,17 +463,21 @@ class MonicaDRMGen:
                 det_to_idx = {n: i for i, n in enumerate(names)}
 
             arch_tag = "outin_lowrank" if lowrank else "outin_dense"
-            ms_entry = _MODEL_STORE.get(arch_tag, ckpt_outin)
+            ms_entry = _MODEL_STORE.get(arch_tag, ckpt_path)
             if ms_entry is None:
                 if lowrank:
-                    model = _MonicaNetOutInLowRank(in_dim=in_dim, det_count=len(det_to_idx),
-                                                   n_out=n_out, n_in=n_in,
-                                                   hidden_dims=hidden_dims, rank=rank)
+                    model = _MonicaNetOutInLowRank(
+                        in_dim=in_dim, det_count=len(det_to_idx),
+                        n_out=n_out, n_in=n_in,
+                        hidden_dims=hidden_dims, rank=rank
+                    )
                 else:
-                    model = _MonicaNetOutIn(in_dim=in_dim, det_count=len(det_to_idx),
-                                            hidden_dims=hidden_dims, n_out=n_out, n_in=n_in)
+                    model = _MonicaNetOutIn(
+                        in_dim=in_dim, det_count=len(det_to_idx),
+                        hidden_dims=hidden_dims, n_out=n_out, n_in=n_in
+                    )
                 model.load_state_dict(ckpt["model"])
-                # Optional inference transforms once
+
                 if os.getenv("MONICA_COMPILE", "").strip():
                     try:
                         model = torch.compile(model, mode=os.getenv("MONICA_COMPILE").strip())
@@ -435,11 +496,12 @@ class MonicaDRMGen:
                         model = torch.jit.trace(model, (ex_x, ex_det))
                     except Exception:
                         pass
-                model = model.to(self.device).eval()
-                _MODEL_STORE.put(arch_tag, ckpt_outin, model, det_to_idx, cfg)
-                ms_entry = (model, det_to_idx, cfg)
-            model, det_to_idx, cfg = ms_entry
 
+                model = model.to(self.device).eval()
+                _MODEL_STORE.put(arch_tag, ckpt_path, model, det_to_idx, cfg)
+                ms_entry = (model, det_to_idx, cfg)
+
+            model, det_to_idx, cfg = ms_entry
             self._model = model
             self._target_mode = "outin"
             self._det_to_idx = det_to_idx
@@ -447,49 +509,54 @@ class MonicaDRMGen:
             self._det_id_t = torch.tensor([self._det_id], dtype=torch.long)
 
             self._model_label = self._model_label_env or (
-                f"outin_lr{rank}_{hidden_dims[0]}-{hidden_dims[1]}-{hidden_dims[2]}" if lowrank
-                else f"outin_{hidden_dims[0]}-{hidden_dims[1]}-{hidden_dims[2]}"
+                f"outin_lr{rank}_{hidden_dims[0]}-{hidden_dims[1]}-{hidden_dims[2]}"
+                if lowrank else
+                f"outin_{hidden_dims[0]}-{hidden_dims[1]}-{hidden_dims[2]}"
             )
 
+        # -------------------------
+        # NATIVE path
+        # -------------------------
         else:
-            # Native path (share single native model across dets)
-            self._out_edges = read_cspec_out_edges(self.cspecfile).astype(np.float64)
-            if self.det_long.startswith("NAI_"):
-                in_edges = self.nai_in_edges_path_arg or (cfg_get(cfgm, "nai_in_edges") if cfgm else "")
-            else:
-                in_edges = self.bgo_in_edges_path_arg or (cfg_get(cfgm, "bgo_in_edges") if cfgm else "")
-            if not in_edges:
-                raise RuntimeError("Input edges path for family not provided")
-            self._in_edges = np.load(in_edges).astype(np.float64)
-
             e_in, _, epx_lo, epx_hi = load_energy_axes(self.db_path, self.det_group)
             self._e_in = e_in.astype(np.float64)
             self._epx_lo = epx_lo.astype(np.float64)
             self._epx_hi = epx_hi.astype(np.float64)
 
-            ckpt_path = self.model_path_arg or (cfg_get(cfgm, "model_path") if cfgm else "")
-            if (not ckpt_path) or (not os.path.isfile(ckpt_path)):
-                if cfgm:
-                    name = os.environ.get("MONICA_MODEL") or cfg_get(cfgm, "selected_model")
-                    if name:
-                        ms = cfgm.get("model_set", {})
-                        ckpt_path = str(ms.get(name, "")).strip()
-            if (not ckpt_path) or (not os.path.isfile(ckpt_path)):
-                raise RuntimeError(f"Monica native model checkpoint not found: {ckpt_path}")
-
             ms_entry = _MODEL_STORE.get("native", ckpt_path)
             if ms_entry is None:
-                ckpt = torch.load(ckpt_path, map_location="cpu")
-                cfg = ckpt.get("config", {})
                 in_dim = int(cfg.get("in_dim", 12))
-                hidden_dims = tuple(int(x) for x in cfg.get("hidden_dims", [256,256,256]))
+                hidden_dims = tuple(int(x) for x in cfg.get("hidden_dims", [256, 256, 256]))
+                head = str(cfg.get("head", "effshape")).lower()
+                shape_basis = int(cfg.get("shape_basis", 0) or 0)
+
                 det_to_idx = ckpt.get("det_to_idx", None)
                 if det_to_idx is None:
                     names = [f"NAI_0{i}" for i in range(10)] + ["NAI_10", "NAI_11", "BGO_00", "BGO_01"]
                     det_to_idx = {n: i for i, n in enumerate(names)}
-                model = _MonicaNetNative(in_dim=in_dim, det_count=len(det_to_idx), hidden_dims=hidden_dims)
+
+                if head == "direct":
+                    model = MonicaNetDirect(
+                        in_dim=in_dim,
+                        det_count=len(det_to_idx),
+                        hidden_dims=hidden_dims
+                    )
+                elif shape_basis > 0:
+                    model = MonicaNetFactorized(
+                        in_dim=in_dim,
+                        det_count=len(det_to_idx),
+                        hidden_dims=hidden_dims,
+                        shape_basis=shape_basis
+                    )
+                else:
+                    model = MonicaNetDense(
+                        in_dim=in_dim,
+                        det_count=len(det_to_idx),
+                        hidden_dims=hidden_dims
+                    )
+
                 model.load_state_dict(ckpt["model"])
-                # Optional transforms once
+
                 if os.getenv("MONICA_COMPILE", "").strip():
                     try:
                         model = torch.compile(model, mode=os.getenv("MONICA_COMPILE").strip())
@@ -508,23 +575,29 @@ class MonicaDRMGen:
                         model = torch.jit.trace(model, (ex_x, ex_det))
                     except Exception:
                         pass
+
                 model = model.to(self.device).eval()
                 _MODEL_STORE.put("native", ckpt_path, model, det_to_idx, cfg)
                 ms_entry = (model, det_to_idx, cfg)
-            model, det_to_idx, cfg = ms_entry
 
+            model, det_to_idx, cfg = ms_entry
             self._model = model
             self._target_mode = "native"
             self._det_to_idx = det_to_idx
             self._det_id = int(det_to_idx[self.det_long])
             self._det_id_t = torch.tensor([self._det_id], dtype=torch.long)
-            hidden_dims = tuple(int(x) for x in cfg.get("hidden_dims", [256,256,256]))
-            self._model_label = self._model_label_env or f"native_{hidden_dims[0]}-{hidden_dims[1]}-{hidden_dims[2]}"
+
+            head = str(cfg.get("head", "effshape")).lower()
+            hidden_dims = tuple(int(x) for x in cfg.get("hidden_dims", [256, 256, 256]))
+            self._model_label = self._model_label_env or f"{head}_{hidden_dims[0]}-{hidden_dims[1]}-{hidden_dims[2]}"
 
             try:
                 self._pre = build_remap_precompute(
-                    e_in=self._e_in, epx_lo=self._epx_lo, epx_hi=self._epx_hi,
-                    target_in_edges=self._in_edges, target_out_edges=self._out_edges
+                    e_in=self._e_in,
+                    epx_lo=self._epx_lo,
+                    epx_hi=self._epx_hi,
+                    target_in_edges=self._in_edges,
+                    target_out_edges=self._out_edges
                 )
             except Exception:
                 self._pre = None
@@ -534,7 +607,7 @@ class MonicaDRMGen:
 
         _BATCHER.register(self)
         self._initialized = True
-
+   
     def _update_sc_pose(self, t: float):
         q = self._pos.quaternion(t)
         sc = self._pos.sc_pos(t)
@@ -639,7 +712,10 @@ class MonicaDRMGen:
         x_t = torch.from_numpy(x)
         det_id = self._det_id_t
         t1 = time.perf_counter()
-        y = self._model(x_t, det_id).squeeze(0).cpu().numpy()
+        y = self._model(x_t, det_id)
+        if isinstance(y, tuple):
+            y = y[0]
+        y = y.squeeze(0).cpu().numpy()
         self._t_model += time.perf_counter() - t1
         if self._target_mode == "outin":
             self._matrix = np.ascontiguousarray(y.astype(np.float64), dtype=np.float64)
@@ -1081,7 +1157,10 @@ class MonicaDRMGenTrig:
         x_t = torch.from_numpy(x)
         det_id = self._det_id_t
         t1 = time.perf_counter()
-        y = self._model(x_t, det_id).squeeze(0).cpu().numpy()
+        y = self._model(x_t, det_id)
+        if isinstance(y, tuple):
+            y = y[0]
+        y = y.squeeze(0).cpu().numpy()
         self._t_model += time.perf_counter() - t1
         if self._target_mode == "outin":
             self._matrix = np.ascontiguousarray(y.astype(np.float64), dtype=np.float64)
