@@ -584,17 +584,44 @@ class MultinestFitTTE(object):
                     return v
                 except Exception:
                     return default
-            model_path   = cfg_get("model_path")
+            model_path      = cfg_get("model_path")
+            nai_model       = cfg_get("nai_model")
+            nai_side0_model = cfg_get("nai_side0_model")
+            nai_side1_model = cfg_get("nai_side1_model")
+            bgo00_model     = cfg_get("bgo00_model")
+            bgo01_model     = cfg_get("bgo01_model")
+
             db_path      = cfg_get("db_path")
             nai_in_edges = cfg_get("nai_in_edges")
             bgo_in_edges = cfg_get("bgo_in_edges")
             device       = cfg_get("device", "cpu")
             batch_size   = int(cfg_get("batch_size", 4096))
-            missing = [n for n, val in [("model_path", model_path), ("db_path", db_path),
-                                        ("nai_in_edges", nai_in_edges), ("bgo_in_edges", bgo_in_edges)]
-                       if val is None]
+
+            missing = [n for n, val in [
+                ("db_path", db_path),
+                ("nai_in_edges", nai_in_edges),
+                ("bgo_in_edges", bgo_in_edges),
+            ] if val is None]
+
             if missing:
-                raise RuntimeError(f"Monica backend requires config keys: {', '.join(missing)} in drm_backend.monica")
+                raise RuntimeError(
+                    f"Monica backend requires config keys: {', '.join(missing)} in drm_backend.monica"
+                )
+
+            any_model = any([
+                model_path,
+                nai_model,
+                nai_side0_model,
+                nai_side1_model,
+                bgo00_model,
+                bgo01_model,
+            ])
+
+            if not any_model:
+                raise RuntimeError(
+                    "Monica backend requires at least one model path in drm_backend.monica "
+                    "(model_path or detector/family-specific model entries)"
+                )
 
         def _resolve_gbm_file(datdir, stem):
             versions = ["v03", "v02", "v01", "v00"]
