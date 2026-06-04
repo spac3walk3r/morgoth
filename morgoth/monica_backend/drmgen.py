@@ -419,10 +419,14 @@ class MonicaDRMGen:
         self._pos = gbmgeometry.PositionInterpolator.from_trigdat(trigdat_file=self.trigdat_file)
         self._update_sc_pose(0.0)
 
+        # gbm_drm_gen convention for centers: phi_cent = 180 - midpoint.
+        # Must match drm_monica/db_reader.compute_centers_from_edges so the
+        # phi feature fed to the NN here matches what the NN saw in training.
+        from drm_monica.db_reader import compute_centers_from_edges
         th_edge, lat_edge, phi_edge = load_atm_grid_info(self.db_path, self.det_group)
-        self._theta_cent = 0.5 * (th_edge[:-1] + th_edge[1:])
-        self._lat_cent   = 0.5 * (lat_edge[:-1] + lat_edge[1:])
-        self._phi_cent   = 0.5 * (phi_edge[:-1] + phi_edge[1:])
+        self._theta_cent, self._lat_cent, self._phi_cent = compute_centers_from_edges(
+            th_edge, lat_edge, phi_edge
+        )
 
         # Family input edges
         if self.det_long.startswith("NAI_"):
@@ -898,10 +902,14 @@ class MonicaDRMGenTrig:
         self._update_sc_pose(0.0)
 
         # Load atm grid centers from DB (used to snap features)
+        # gbm_drm_gen convention for centers: phi_cent = 180 - midpoint.
+        # Must match drm_monica/db_reader.compute_centers_from_edges so the
+        # phi feature fed to the NN here matches what the NN saw in training.
+        from drm_monica.db_reader import compute_centers_from_edges
         th_edge, lat_edge, phi_edge = load_atm_grid_info(self.db_path, self.det_group)
-        self._theta_cent = 0.5 * (th_edge[:-1] + th_edge[1:])
-        self._lat_cent   = 0.5 * (lat_edge[:-1] + lat_edge[1:])
-        self._phi_cent   = 0.5 * (phi_edge[:-1] + phi_edge[1:])
+        self._theta_cent, self._lat_cent, self._phi_cent = compute_centers_from_edges(
+            th_edge, lat_edge, phi_edge
+        )
 
         # Trigdat edges
         self._out_edges = get_trigdat_out_edges(self.det_long).astype(np.float64)
