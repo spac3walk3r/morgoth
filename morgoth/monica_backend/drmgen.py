@@ -387,6 +387,10 @@ class MonicaDRMGen:
         self._theta_cent = None
         self._lat_cent = None
         self._phi_cent = None
+        # Feature set the loaded checkpoint was trained with. Set from the ckpt
+        # config in _lazy_init; drives the _build_features dispatch (v1 snap vs
+        # Option C cell-summed). Default "v1" for legacy checkpoints w/o the key.
+        self._features = "v1"
 
     def _lazy_init(self):
         if self._initialized:
@@ -447,6 +451,10 @@ class MonicaDRMGen:
         # Load checkpoint config to decide native vs out-in
         ckpt = torch.load(ckpt_path, map_location="cpu")
         cfg = ckpt.get("config", {}) or {}
+        # Feature set drives _build_features: "cellsum_v1" (Option C, geocenter
+        # direction) vs "v1" (legacy atm-cell snap). Read it before the model
+        # store may hand back a cached cfg so it reflects THIS detector's ckpt.
+        self._features = str(cfg.get("features", "v1")).lower()
         target_tag = str(cfg.get("target", "")).lower()
         use_outin = (target_tag == "outin")
 
@@ -618,7 +626,13 @@ class MonicaDRMGen:
         self._quat = np.asarray(q, dtype=np.float64)
         self._scpos = np.asarray(sc, dtype=np.float64)
 
-    def _earth_geo_az_el(self) -> tuple[float, float]:
+    def _earth_geo_unit(self) -> np.ndarray:
+        """Geocenter direction as a UNIT vector in the spacecraft body frame --
+        the same frame as the source az/el (from GBMFrame) and the balrog grid.
+        Mirrors gbm_drm_gen's spacecraft-coordinate geodir: rotate the (negated)
+        spacecraft position into the body axes built from the attitude quaternion.
+        Option C's cell-summed features consume this directly (geo unit vector),
+        avoiding any az/el (elevation-vs-zenith) round-trip."""
         q0, q1, q2, q3 = self._quat
         scx = np.array([
             q0*q0 - q1*q1 - q2*q2 + q3*q3,
@@ -637,6 +651,14 @@ class MonicaDRMGen:
         ], dtype=np.float64)
         geodir = np.array([-scx.dot(self._scpos), -scy.dot(self._scpos), -scz.dot(self._scpos)], dtype=np.float64)
         geodir /= (np.linalg.norm(geodir) + 1e-12)
+        return geodir
+
+    def _earth_geo_az_el(self) -> tuple[float, float]:
+        # NOTE: the second return is the geocenter ZENITH angle (arctan2(r_xy, z)),
+        # NOT elevation, despite the name -- preserved because the legacy v1 snap
+        # path consumes it via `theta_geo = 90 - geo_el`. Option C does not use
+        # this method; it calls _earth_geo_unit() directly.
+        geodir = self._earth_geo_unit()
         geo_az = np.arctan2(geodir[1], geodir[0])
         if geo_az < 0.0:
             geo_az += 2.0 * np.pi
@@ -645,6 +667,9 @@ class MonicaDRMGen:
         return float(np.rad2deg(geo_az)), float(np.rad2deg(geo_el))
 
     def _build_features(self, src_az_deg: float, src_el_deg: float) -> np.ndarray:
+        if self._features == "cellsum_v1":
+            return self._build_features_cellsum(src_az_deg, src_el_deg)
+        # --- legacy v1: atm-cell snap (theta_c/lat_c/phi_c) -> 12-dim feature ---
         geo_az_deg, geo_el_deg = self._earth_geo_az_el()
         theta_geo = 90.0 - geo_el_deg
         phi_geo = geo_az_deg
@@ -682,6 +707,33 @@ class MonicaDRMGen:
         sph, cph = _trig(phi_c)
         feat = np.array([saz, caz, sel, cel, sth, cth, slt, clt, sph, cph, cof, ctn], dtype=np.float32)
         return feat
+
+    def _build_features_cellsum(self, src_az_deg: float, src_el_deg: float) -> np.ndarray:
+        """Option C (cell-summed target) feature vector.
+
+        CANONICAL SOURCE: drm-monica scripts/train_baseline.py ::
+        build_features_cellsum (the feature set registered as "cellsum_v1").
+        This MUST stay byte-for-byte identical to that function -- if you change
+        one, change both, or the model receives garbage inputs.
+
+        Layout (length 8, float32):
+            [ sx, sy, sz, gx, gy, gz, cof, sdotg ]
+            src_unit (sx,sy,sz) = [cos(el)cos(az), cos(el)sin(az), sin(el)],
+                az = source Azimuth (deg), el = source ELEVATION (deg, = 90-zenith)
+            geo_unit (gx,gy,gz)  = geocenter unit vector in the SAME spacecraft
+                body frame as src (NOT az/el-rebuilt: taken straight from the
+                spacecraft pose to avoid the elevation-vs-zenith trap)
+            cof   = clip(src_unit . det_normal, -1, 1)  (self._det_n == DET_NORMALS[det])
+            sdotg = clip(src_unit . geo_unit,   -1, 1)  (cos source-geocenter separation)
+
+        No atm-cell snap: this is what lets morgoth's cell-summed inference
+        reproduce the full classical atm sum structurally, in one forward pass."""
+        s = _azel_to_unit(src_az_deg, src_el_deg)          # source unit vector
+        g = self._earth_geo_unit()                         # geocenter unit vector
+        cof = float(np.clip(self._det_n.dot(s), -1.0, 1.0))
+        sdotg = float(np.clip(s.dot(g), -1.0, 1.0))
+        return np.array([s[0], s[1], s[2], g[0], g[1], g[2], cof, sdotg],
+                        dtype=np.float32)
 
     def set_time(self, t: float):
         self._lazy_init()
@@ -876,6 +928,10 @@ class MonicaDRMGenTrig:
         self._theta_cent = None
         self._lat_cent = None
         self._phi_cent = None
+        # Feature set the loaded checkpoint was trained with; set from the ckpt
+        # config in _lazy_init. Drives _build_features (v1 snap vs Option C
+        # cell-summed). Default "v1" for legacy checkpoints without the key.
+        self._features = "v1"
 
     def _lazy_init(self):
         if self._initialized:
@@ -1043,6 +1099,7 @@ class MonicaDRMGenTrig:
             self._det_id_t = torch.tensor([self._det_id], dtype=torch.long)
             hidden_dims = tuple(int(x) for x in cfg.get("hidden_dims", [256,256,256]))
             self._model_label = self._model_label_env or f"native_{hidden_dims[0]}-{hidden_dims[1]}-{hidden_dims[2]}"
+            self._features = str(cfg.get("features", "v1")).lower()
             # Precompute remap for trigdat out edges
             try:
                 self._pre = build_remap_precompute(
@@ -1064,7 +1121,13 @@ class MonicaDRMGenTrig:
         self._quat = np.asarray(q, dtype=np.float64)
         self._scpos = np.asarray(sc, dtype=np.float64)
 
-    def _earth_geo_az_el(self) -> tuple[float, float]:
+    def _earth_geo_unit(self) -> np.ndarray:
+        """Geocenter direction as a UNIT vector in the spacecraft body frame --
+        the same frame as the source az/el (from GBMFrame) and the balrog grid.
+        Mirrors gbm_drm_gen's spacecraft-coordinate geodir: rotate the (negated)
+        spacecraft position into the body axes built from the attitude quaternion.
+        Option C's cell-summed features consume this directly (geo unit vector),
+        avoiding any az/el (elevation-vs-zenith) round-trip."""
         q0, q1, q2, q3 = self._quat
         scx = np.array([
             q0*q0 - q1*q1 - q2*q2 + q3*q3,
@@ -1083,6 +1146,14 @@ class MonicaDRMGenTrig:
         ], dtype=np.float64)
         geodir = np.array([-scx.dot(self._scpos), -scy.dot(self._scpos), -scz.dot(self._scpos)], dtype=np.float64)
         geodir /= (np.linalg.norm(geodir) + 1e-12)
+        return geodir
+
+    def _earth_geo_az_el(self) -> tuple[float, float]:
+        # NOTE: the second return is the geocenter ZENITH angle (arctan2(r_xy, z)),
+        # NOT elevation, despite the name -- preserved because the legacy v1 snap
+        # path consumes it via `theta_geo = 90 - geo_el`. Option C does not use
+        # this method; it calls _earth_geo_unit() directly.
+        geodir = self._earth_geo_unit()
         geo_az = np.arctan2(geodir[1], geodir[0])
         if geo_az < 0.0:
             geo_az += 2.0 * np.pi
@@ -1091,6 +1162,9 @@ class MonicaDRMGenTrig:
         return float(np.rad2deg(geo_az)), float(np.rad2deg(geo_el))
 
     def _build_features(self, src_az_deg: float, src_el_deg: float) -> np.ndarray:
+        if self._features == "cellsum_v1":
+            return self._build_features_cellsum(src_az_deg, src_el_deg)
+        # --- legacy v1: atm-cell snap (theta_c/lat_c/phi_c) -> 12-dim feature ---
         geo_az_deg, geo_el_deg = self._earth_geo_az_el()
         theta_geo = 90.0 - geo_el_deg
         phi_geo = geo_az_deg
@@ -1126,6 +1200,33 @@ class MonicaDRMGenTrig:
         sph, cph = _trig(phi_c)
         feat = np.array([saz, caz, sel, cel, sth, cth, slt, clt, sph, cph, cof, ctn], dtype=np.float32)
         return feat
+
+    def _build_features_cellsum(self, src_az_deg: float, src_el_deg: float) -> np.ndarray:
+        """Option C (cell-summed target) feature vector.
+
+        CANONICAL SOURCE: drm-monica scripts/train_baseline.py ::
+        build_features_cellsum (the feature set registered as "cellsum_v1").
+        This MUST stay byte-for-byte identical to that function -- if you change
+        one, change both, or the model receives garbage inputs.
+
+        Layout (length 8, float32):
+            [ sx, sy, sz, gx, gy, gz, cof, sdotg ]
+            src_unit (sx,sy,sz) = [cos(el)cos(az), cos(el)sin(az), sin(el)],
+                az = source Azimuth (deg), el = source ELEVATION (deg, = 90-zenith)
+            geo_unit (gx,gy,gz)  = geocenter unit vector in the SAME spacecraft
+                body frame as src (NOT az/el-rebuilt: taken straight from the
+                spacecraft pose to avoid the elevation-vs-zenith trap)
+            cof   = clip(src_unit . det_normal, -1, 1)  (self._det_n == DET_NORMALS[det])
+            sdotg = clip(src_unit . geo_unit,   -1, 1)  (cos source-geocenter separation)
+
+        No atm-cell snap: this is what lets morgoth's cell-summed inference
+        reproduce the full classical atm sum structurally, in one forward pass."""
+        s = _azel_to_unit(src_az_deg, src_el_deg)          # source unit vector
+        g = self._earth_geo_unit()                         # geocenter unit vector
+        cof = float(np.clip(self._det_n.dot(s), -1.0, 1.0))
+        sdotg = float(np.clip(s.dot(g), -1.0, 1.0))
+        return np.array([s[0], s[1], s[2], g[0], g[1], g[2], cof, sdotg],
+                        dtype=np.float32)
 
     def set_time(self, t: float):
         self._lazy_init()
