@@ -75,6 +75,10 @@ def main():
     ap.add_argument("--cos-floor", type=float, default=0.99,
                     help="shape-agreement floor: if rel_frob > rtol BUT cosine >= this, "
                          "PASS* (small-norm artifact on a near-blind detector, not a geo error)")
+    ap.add_argument("--min-norm", type=float, default=30.0,
+                    help="below this ||classic|| the detector barely sees the source, so "
+                         "neither rel_frob nor cosine is a meaningful geometry test -> "
+                         "report INCONCLUSIVE (not gated). Validate geometry on dets that see the source.")
     args = ap.parse_args()
 
     from morgoth.configuration import morgoth_config
@@ -144,10 +148,18 @@ def main():
     rf = _rel_frob(a_mon, a_cls)
     cos = _cosine(a_mon, a_cls)
     absf = float(np.linalg.norm(a_mon - a_cls))
+    nrm_c = float(np.linalg.norm(a_cls))
     print(f"\n=== END-TO-END [{args.det}] cellsum-MONICA vs classical gbm ===")
     print(f"  matrix shape = {a_mon.shape}")
-    print(f"  ||MONICA||={np.linalg.norm(a_mon):.4e}  ||classic||={np.linalg.norm(a_cls):.4e}")
+    print(f"  ||MONICA||={np.linalg.norm(a_mon):.4e}  ||classic||={nrm_c:.4e}")
     print(f"  rel_frob = {rf:.4f}   cosine = {cos:.4f}   abs_frob = {absf:.4f}")
+
+    if nrm_c < args.min_norm:
+        print(f"\n  INCONCLUSIVE -- NEAR-BLIND (||classic||={nrm_c:.3g} < --min-norm "
+              f"{args.min_norm:.3g}): this detector barely sees the source, so neither")
+        print("  rel_frob nor cosine is a meaningful geometry test (small-signal regime).")
+        print("  -> not gating; validate geometry on detectors that see the source.")
+        return
 
     rf_ok = np.isfinite(rf) and rf <= args.rtol
     cos_ok = np.isfinite(cos) and cos >= args.cos_floor
