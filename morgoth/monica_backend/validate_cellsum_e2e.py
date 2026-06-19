@@ -25,13 +25,12 @@ Checks, in order:
   (3) DRM rel_frob: MONICA (cellsum) vs classical gbm_drm_gen for the same pose.
 
 Run on server (needs morgoth + gbm_drm_gen, a cellsum checkpoint wired into
-morgoth_config, and one GRB's trigdat + cspec + tte). Example:
+morgoth_config, and one GRB's trigdat + cspec -- no TTE required). Example:
 
   python -m morgoth.monica_backend.validate_cellsum_e2e \
     --det n7 --ra 123.4 --dec -5.6 --t 0.0 \
     --trigdat glg_trigdat_all_bn231012345_v01.fit \
-    --cspec  glg_cspec_n7_bn231012345_v00.pha \
-    --tte    glg_tte_n7_bn231012345_v00.fit.gz
+    --cspec  glg_cspec_n7_bn231012345_v00.pha
 """
 import os
 import argparse
@@ -62,7 +61,6 @@ def main():
     ap.add_argument("--t", type=float, default=0.0, help="response time (s from trigger)")
     ap.add_argument("--trigdat", required=True)
     ap.add_argument("--cspec", required=True)
-    ap.add_argument("--tte", required=True)
     ap.add_argument("--rtol", type=float, default=0.10,
                     help="gate: max rel_frob to PASS (default 0.10 ~ a few % + margin)")
     args = ap.parse_args()
@@ -90,6 +88,7 @@ def main():
         bgo_in_edges=str(cfg_get("bgo_in_edges")),
         device=str(cfg_get("device", "cpu")),
         batch_size=int(cfg_get("batch_size", 4096)),
+        occult=False,
     )
     mon.set_time(args.t)
 
@@ -118,12 +117,14 @@ def main():
     mon.set_location(args.ra, args.dec)
     M_mon = mon.matrix
 
-    # ---- classical gbm_drm_gen, same pose ----
-    # NOTE: confirm this accessor matches your installed gbm_drm_gen version --
-    # DRMGenTTE(...).set_location(ra, dec) then `.matrix` is the standard path.
-    from gbm_drm_gen.drmgen import DRMGenTTE
-    cls = DRMGenTTE(tte_file=args.tte, trigdat=args.trigdat, mat_type=2,
-                    cspecfile=args.cspec, occult=True)
+    # ---- classical gbm_drm_gen at the SAME pose time (no TTE needed) ----
+    # Mirrors monica-morgoth-validation/07_priority1_drm_comparison_at_swift.py:
+    # DRMGen.from_128_bin_data(..., time=t).set_location(ra,dec).matrix. Passing
+    # time=args.t keeps the classical pose identical to MONICA's set_time(args.t).
+    from gbm_drm_gen.drmgen import DRMGen
+    cls = DRMGen.from_128_bin_data(det_name=mon.det_long, time=args.t,
+                                   cspecfile=args.cspec, trigdat=args.trigdat,
+                                   mat_type=2, occult=False)
     cls.set_location(args.ra, args.dec)
     M_cls = np.asarray(cls.matrix, dtype=np.float64)
 
