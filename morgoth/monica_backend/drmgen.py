@@ -27,6 +27,36 @@ except Exception:
     morgoth_config = None
 
 
+import json
+
+
+def _dump_jsonl(path: str, rec: dict):
+    """Append one JSON record per line (MONICA_DUMP_FEATURES probe)."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def _dump_cellsum_features(gen, src_az_deg, src_el_deg, s, g, cof, sdotg, feat):
+    """Log the exact cellsum_v1 feature record fed to the model, one JSONL line
+    per (GRB, detector, MPI rank). Gated by gen._dump_features; dir from
+    MONICA_DUMP_DIR. geo_az/el are derived from the geo unit vector for
+    readability (elevation = arcsin(g_z), NOT the zenith of _earth_geo_az_el)."""
+    geo_az = float(np.rad2deg(np.arctan2(float(g[1]), float(g[0]))) % 360.0)
+    geo_el = float(np.rad2deg(np.arcsin(np.clip(float(g[2]), -1.0, 1.0))))
+    out_path = os.path.join(
+        gen._dump_dir, f"{gen._bn or 'bn_unknown'}_{gen.det_long}_rank{gen._rank}.jsonl")
+    _dump_jsonl(out_path, dict(
+        bn=gen._bn, det=gen.det_long, rank=gen._rank,
+        time=getattr(gen, "_time", None), pose_id=int(getattr(gen, "_pose_id", 0)),
+        features="cellsum_v1",
+        src_az_deg=float(src_az_deg), src_el_deg=float(src_el_deg),
+        src_unit=[float(s[0]), float(s[1]), float(s[2])],
+        geo_unit=[float(g[0]), float(g[1]), float(g[2])],
+        geo_az_deg=geo_az, geo_el_deg=geo_el,
+        cof=float(cof), sdotg=float(sdotg),
+        feat=[float(x) for x in feat.tolist()]))
+
 
 def cfg_get(node, key, default=""):
     try:
@@ -391,6 +421,9 @@ class MonicaDRMGen:
         # config in _lazy_init; drives the _build_features dispatch (v1 snap vs
         # Option C cell-summed). Default "v1" for legacy checkpoints w/o the key.
         self._features = "v1"
+        # MONICA_DUMP_FEATURES probe: log the per-call feature record for later checks.
+        self._dump_features = (os.getenv("MONICA_DUMP_FEATURES", "0") == "1")
+        self._dump_dir = os.getenv("MONICA_DUMP_DIR", "").strip() or os.path.join(os.getcwd(), "monica_feature_dumps")
 
     def _lazy_init(self):
         if self._initialized:
@@ -732,8 +765,11 @@ class MonicaDRMGen:
         g = self._earth_geo_unit()                         # geocenter unit vector
         cof = float(np.clip(self._det_n.dot(s), -1.0, 1.0))
         sdotg = float(np.clip(s.dot(g), -1.0, 1.0))
-        return np.array([s[0], s[1], s[2], g[0], g[1], g[2], cof, sdotg],
+        feat = np.array([s[0], s[1], s[2], g[0], g[1], g[2], cof, sdotg],
                         dtype=np.float32)
+        if getattr(self, "_dump_features", False):
+            _dump_cellsum_features(self, src_az_deg, src_el_deg, s, g, cof, sdotg, feat)
+        return feat
 
     def set_time(self, t: float):
         self._lazy_init()
@@ -932,6 +968,9 @@ class MonicaDRMGenTrig:
         # config in _lazy_init. Drives _build_features (v1 snap vs Option C
         # cell-summed). Default "v1" for legacy checkpoints without the key.
         self._features = "v1"
+        # MONICA_DUMP_FEATURES probe: log the per-call feature record for later checks.
+        self._dump_features = (os.getenv("MONICA_DUMP_FEATURES", "0") == "1")
+        self._dump_dir = os.getenv("MONICA_DUMP_DIR", "").strip() or os.path.join(os.getcwd(), "monica_feature_dumps")
 
     def _lazy_init(self):
         if self._initialized:
@@ -1225,8 +1264,11 @@ class MonicaDRMGenTrig:
         g = self._earth_geo_unit()                         # geocenter unit vector
         cof = float(np.clip(self._det_n.dot(s), -1.0, 1.0))
         sdotg = float(np.clip(s.dot(g), -1.0, 1.0))
-        return np.array([s[0], s[1], s[2], g[0], g[1], g[2], cof, sdotg],
+        feat = np.array([s[0], s[1], s[2], g[0], g[1], g[2], cof, sdotg],
                         dtype=np.float32)
+        if getattr(self, "_dump_features", False):
+            _dump_cellsum_features(self, src_az_deg, src_el_deg, s, g, cof, sdotg, feat)
+        return feat
 
     def set_time(self, t: float):
         self._lazy_init()
