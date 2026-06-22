@@ -303,7 +303,7 @@ class MultinestFitTrigdat(object):
 
         self._bayes.set_sampler("multinest", share_spectrum=True)
         self._bayes.sampler.setup(
-            n_live_points=500, chain_name=chain_path, wrapped_params=wrap, verbose=True
+            n_live_points=800, chain_name=chain_path, wrapped_params=wrap, verbose=True
         )
         self._bayes.sample()
 
@@ -840,10 +840,10 @@ class MultinestFitTTE(object):
         self._bayes.set_sampler("multinest", share_spectrum=True)
 
         self._bayes.sampler.setup(
-            n_live_points=400, chain_name=chain_path, wrapped_params=wrap, verbose=True, seed=SEED
+            n_live_points=800, chain_name=chain_path, wrapped_params=wrap, verbose=True, seed=SEED
         )
         #self._bayes.sampler.setup(
-        #    n_live_points=400, chain_name=chain_path, wrapped_params=wrap, importance_nested_sampling=True, verbose=True, seed=SEED
+        #    n_live_points=800, chain_name=chain_path, wrapped_params=wrap, importance_nested_sampling=True, verbose=True, seed=SEED
         #)
         self._bayes.sample()
 
