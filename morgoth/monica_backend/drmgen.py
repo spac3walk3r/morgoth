@@ -280,21 +280,22 @@ class _BatchGroup:
                 inst._matrix = R
                 inst._n_calls += 1
             return
-        # Occult: test once (az/el are scalars here)
-        inst0 = self.instances[0]
-        occulted = inst0._occult and is_occulted(float(az_deg), float(el_deg), inst0._scpos)
-        if occulted:
-            outs = []
-            for inst in self.instances:
-                Nout = len(inst._out_edges) - 1
-                Nin  = len(inst._in_edges) - 1
-                R = np.zeros((Nout, Nin), dtype=np.float64, order="C")
-                inst._matrix = R
-                inst._n_calls += 1
-                outs.append(R)
-            self._last_key = key
-            self._last_outputs = outs
-            return
+        # NOTE: occultation is intentionally NOT tested here. It is handled
+        # correctly in MonicaDRMGen/MonicaDRMGenTrig.set_location() using
+        # EQUATORIAL ra/dec -- the frame is_occulted() requires (it compares
+        # against -scpos, which is equatorial) -- and early-returns a zeroed
+        # matrix BEFORE this batched path is ever reached
+        # (set_location -> set_location_direct_sat_coord -> _BATCHER.run, and
+        # set_location_direct_sat_coord has no other caller).
+        #
+        # The previous check here called is_occulted(az_deg, el_deg, scpos) --
+        # SPACECRAFT-frame az/el passed into a function expecting equatorial
+        # ra/dec. That frame mismatch spuriously flagged a ~67-deg cap of
+        # visible directions as occulted and zeroed every detector's response
+        # during sampling, corrupting the likelihood surface and producing
+        # tight-but-wrong localizations tens of degrees off (only when MONICA
+        # was built with occult=True, i.e. the campaign; the e2e gate and the
+        # 07 diagnostic used occult=False, which is why they never saw it).
         # Build features and det_ids
         feats = []
         det_ids = []
